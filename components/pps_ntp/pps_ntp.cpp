@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <sdkconfig.h>
 #include <esp_attr.h>
 #include <esp_timer.h>
 #include <lwip/sockets.h>
@@ -13,12 +14,15 @@
 #include "esphome/components/network/util.h"
 #include "esphome/core/log.h"
 
+#if defined(USE_PPS_NTP_TASK_CORE) && CONFIG_FREERTOS_NUMBER_OF_CORES < 2
+#error "pps_ntp: task_core is set, but this build has a single FreeRTOS core"
+#endif
+
 namespace esphome::pps_ntp {
 
 static const char *const TAG = "pps_ntp";
 
 static constexpr int MIN_PULSES_FOR_SYNC = 4;
-static constexpr double MAX_RESIDUAL_US = 1000.0;     // a pulse further than this from the model is an outlier
 static constexpr double MAX_RATE_ERROR_PPM = 500.0;   // reject fits that imply a broken crystal
 static constexpr int64_t MAX_PULSE_GAP_S = 600;       // longer gaps are relabelled from NMEA
 static constexpr int64_t FIX_STALE_US = 3000000;      // pulses only count while the receiver reports a fix
@@ -78,6 +82,8 @@ void IRAM_ATTR PPSNTPServer::pps_isr(PPSNTPServer *self) {
 
 void PPSNTPServer::setup() {
   this->boot_ms_ = millis();
+  this->hist_local_.assign(this->fit_window_, 0);
+  this->hist_utc_.assign(this->fit_window_, 0);
   this->hw_capture_ = this->setup_capture_();
   if (!this->hw_capture_) {
     this->pps_pin_->setup();
@@ -94,7 +100,9 @@ void PPSNTPServer::loop() {
   // our setup(); calling socket() earlier asserts on an uninitialised lwIP mutex
   if (this->task_ == nullptr && network::is_connected()) {
     // Run on the core the ESPHome loop isn't on, so request timestamps don't wait out its critical sections
-#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+#if defined(USE_PPS_NTP_TASK_CORE)
+    BaseType_t core = USE_PPS_NTP_TASK_CORE;
+#elif CONFIG_FREERTOS_NUMBER_OF_CORES > 1
     BaseType_t core = xPortGetCoreID() == 0 ? 1 : 0;
 #else
     BaseType_t core = tskNO_AFFINITY;
@@ -265,8 +273,15 @@ void PPSNTPServer::dump_config() {
 #endif
   ESP_LOGCONFIG(TAG,
                 "  Port: %u\n"
-                "  Holdover: %us",
-                this->port_, static_cast<unsigned>(this->holdover_us_ / 1000000));
+                "  Holdover: %us\n"
+                "  Fit window: %d pulses\n"
+                "  Max residual: %.0f µs\n"
+                "  Refid: %.4s",
+                this->port_, static_cast<unsigned>(this->holdover_us_ / 1000000), this->fit_window_,
+                this->max_residual_us_, this->refid_);
+#ifdef USE_PPS_NTP_TASK_CORE
+  ESP_LOGCONFIG(TAG, "  Task core: %d (pinned)", USE_PPS_NTP_TASK_CORE);
+#endif
   if (this->gnss_baud_rate_ != 0) {
     ESP_LOGCONFIG(TAG, "  GNSS baud rate: %u (from %u)", static_cast<unsigned>(this->gnss_baud_rate_),
                   static_cast<unsigned>(this->original_baud_));
@@ -319,7 +334,7 @@ void PPSNTPServer::accept_pulse_(int64_t local_us, int64_t utc_s) {
   if (this->model_.valid) {
     double predicted = this->model_.anchor_local_us + (utc_s - this->model_.anchor_utc_s) * this->model_.local_us_per_s;
     double residual = static_cast<double>(local_us) - predicted;
-    if (std::fabs(residual) > MAX_RESIDUAL_US) {
+    if (std::fabs(residual) > this->max_residual_us_) {
       if (++this->outliers_ < 3) {
         ESP_LOGW(TAG, "PPS pulse %.0f µs from prediction; ignoring", residual);
         return;
@@ -334,8 +349,8 @@ void PPSNTPServer::accept_pulse_(int64_t local_us, int64_t utc_s) {
 
   this->hist_local_[this->hist_head_] = local_us;
   this->hist_utc_[this->hist_head_] = utc_s;
-  this->hist_head_ = (this->hist_head_ + 1) % HISTORY_SIZE;
-  if (this->hist_count_ < HISTORY_SIZE)
+  this->hist_head_ = (this->hist_head_ + 1) % this->fit_window_;
+  if (this->hist_count_ < this->fit_window_)
     this->hist_count_++;
   this->last_accepted_local_us_ = local_us;
   this->last_accepted_utc_s_ = utc_s;
@@ -681,9 +696,10 @@ void PPSNTPServer::ntp_loop_() {
       reply[0] = ((synced ? 0 : 3) << 6) | (version << 3) | 4;  // LI, VN, mode = server
       reply[1] = synced ? 1 : 16;
       reply[2] = request[2];                       // poll
-      reply[3] = static_cast<uint8_t>(-20);       // precision ~1 µs
+      // Precision: hardware capture ~1 µs (2^-20 s); the GPIO interrupt adds a few µs of latency jitter (2^-18)
+      reply[3] = static_cast<uint8_t>(this->hw_capture_ ? -20 : -18);
       put_be32(reply + 8, static_cast<uint32_t>(std::min(dispersion_us * 65536.0 / 1e6, 4294967295.0)));
-      memcpy(reply + 12, "GPS", 4);
+      memcpy(reply + 12, this->refid_, 4);
       put_ntp_timestamp(reply + 16, model.anchor_utc_s * 1000000LL);
       memcpy(reply + 24, request + 40, 8);  // originate = client's transmit
       put_ntp_timestamp(reply + 32, utc_us_at(model, rx_local));

@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
+#include <vector>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -40,6 +42,9 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void set_port(uint16_t port) { this->port_ = port; }
   void set_holdover_s(uint32_t seconds) { this->holdover_us_ = static_cast<int64_t>(seconds) * 1000000LL; }
   void set_gnss_baud_rate(uint32_t baud) { this->gnss_baud_rate_ = baud; }
+  void set_fit_window(int pulses) { this->fit_window_ = pulses; }
+  void set_max_residual_us(double us) { this->max_residual_us_ = us; }
+  void set_refid(const char *refid) { strncpy(this->refid_, refid, sizeof(this->refid_)); }
 
   void set_satellites_sensor(sensor::Sensor *s) { this->satellites_sensor_ = s; }
   void set_frequency_offset_sensor(sensor::Sensor *s) { this->frequency_offset_sensor_ = s; }
@@ -103,9 +108,11 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   uint8_t label_mismatches_{0};
   uint8_t outliers_{0};
 
-  static constexpr int HISTORY_SIZE = 64;
-  int64_t hist_local_[HISTORY_SIZE];
-  int64_t hist_utc_[HISTORY_SIZE];
+  int fit_window_{64};
+  double max_residual_us_{1000.0};
+  char refid_[4]{'G', 'P', 'S', '\0'};  // NTP refid: up to 4 ASCII chars, zero-padded, not NUL-terminated
+  std::vector<int64_t> hist_local_;
+  std::vector<int64_t> hist_utc_;
   int hist_count_{0};
   int hist_head_{0};  // index of the next write
   int64_t last_accepted_local_us_{0};
