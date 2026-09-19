@@ -1,5 +1,7 @@
 # esphome-pps-ntp
 
+[![CI](https://github.com/davidcoulson/esphome-pps-ntp/actions/workflows/ci.yml/badge.svg)](https://github.com/davidcoulson/esphome-pps-ntp/actions/workflows/ci.yml)
+
 An [ESPHome](https://esphome.io) external component that turns an ESP32 with Ethernet and a GNSS receiver into a **stratum-1 NTP server** disciplined by the receiver's **PPS (pulse-per-second)** output.
 
 > **Status: experimental.** Compiles against ESPHome 2026.9 on ESP-IDF 5.5 and 6.1 for ESP32-S3, ESP32-C3 and ESP32-P4 (including pre-v3 silicon via `engineering_sample: true`). Hardware testing is in progress.
