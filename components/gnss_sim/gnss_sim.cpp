@@ -18,6 +18,7 @@ namespace esphome::gnss_sim {
 static const char *const TAG = "gnss_sim";
 static constexpr int64_t MIN_VALID_TIME_S = 1767225600;  // 2026-01-01: the system clock has been set
 static constexpr int64_t GPS_WEEK_ROLLOVER_S = 619315200;
+static constexpr int64_t LEAP_DAY_235959_S = 1798761599;  // 2026-12-31 23:59:59 UTC
 
 void GNSSSim::setup() {
   auto port = static_cast<uart_port_t>(this->uart_num_);
@@ -144,7 +145,7 @@ void GNSSSim::loop() {
   if (this->epoch_pending_ && now >= this->epoch_due_us_) {
     this->epoch_pending_ = false;
     if (this->nmea_enabled_)
-      this->send_epoch_(this->first_epoch_s_ + this->handled_pulse_ - 1 + this->epoch_offset_s_);
+      this->send_epoch_(this->handled_pulse_);
   }
 
   this->read_commands_();
@@ -161,10 +162,26 @@ void GNSSSim::send_nmea_(const std::string &body) {
 }
 
 // The default sentence set of a u-blox 6/7, in its order, so the UART carries a realistic load
-void GNSSSim::send_epoch_(int64_t utc_s) {
+void GNSSSim::arm_leap(uint32_t seconds_from_now) {
+  this->leap_pulse_ = this->handled_pulse_ + seconds_from_now;
+  // Make the pulse just before it read 23:59:59 on 31 December
+  this->epoch_offset_s_ = LEAP_DAY_235959_S - (this->first_epoch_s_ + (this->leap_pulse_ - 1) - 1);
+  ESP_LOGW(TAG, "Leap second armed: 23:59:60 in %u s (the reported date jumps to 2026-12-31)",
+           static_cast<unsigned>(seconds_from_now));
+}
+
+void GNSSSim::send_epoch_(uint32_t pulse) {
+  bool in_leap = this->leap_pulse_ != 0 && pulse == this->leap_pulse_;
+  // After the inserted second, UTC is one behind the pulse count
+  int64_t utc_s = this->first_epoch_s_ + pulse - 1 + this->epoch_offset_s_ -
+                  ((this->leap_pulse_ != 0 && pulse >= this->leap_pulse_) ? 1 : 0);
   time_t t = static_cast<time_t>(utc_s - (this->week_rollover_ ? GPS_WEEK_ROLLOVER_S : 0));
   struct tm tm;
   gmtime_r(&t, &tm);
+  if (in_leap) {
+    tm.tm_sec = 60;
+    ESP_LOGW(TAG, "Sending 23:59:60");
+  }
   char hms[16], buf[128];
   snprintf(hms, sizeof(hms), "%02d%02d%02d.00", tm.tm_hour, tm.tm_min, tm.tm_sec);
   char status = this->fix_ ? 'A' : 'V';
@@ -248,6 +265,19 @@ void GNSSSim::handle_ubx_(uint8_t cls, uint8_t id, const uint8_t *payload, uint1
     uint8_t p[20] = {0};
     p[19] = this->utc_valid_ ? 0x07 : 0x03;  // validTOW | validWKN | validUTC
     this->send_ubx_(0x01, 0x21, p, sizeof(p));
+  } else if (cls == 0x01 && id == 0x26 && len == 0) {  // poll NAV-TIMELS
+    if (!this->answer_timels_)
+      return;
+    uint8_t p[24] = {0};
+    bool pending = this->leap_pulse_ != 0 && this->leap_pulse_ >= this->handled_pulse_;
+    int32_t to_event = pending ? static_cast<int32_t>(this->leap_pulse_ + 1 - this->handled_pulse_) : 0;
+    p[8] = 2;   // srcOfCurrLs: GPS
+    p[9] = 18;  // currLs
+    p[10] = 2;
+    p[11] = pending ? 1 : 0;
+    memcpy(p + 12, &to_event, 4);
+    p[23] = 0x03;
+    this->send_ubx_(0x01, 0x26, p, sizeof(p));
   } else if (cls == 0x06 && id == 0x00 && len == 20) {  // CFG-PRT: acknowledge at the old baud, then switch
     uint32_t baud = payload[8] | (payload[9] << 8) | (payload[10] << 16) | (static_cast<uint32_t>(payload[11]) << 24);
     this->send_ubx_(0x05, 0x01, ack, sizeof(ack));

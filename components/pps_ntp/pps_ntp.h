@@ -35,6 +35,12 @@ struct ClockModel {
   double local_us_per_s{1e6};  // local microseconds per true second (crystal rate)
   int64_t last_pulse_local_us{0};  // raw local time of the most recent accepted pulse
   bool utc_trusted{false};     // receiver confirmed UTC (leap seconds known)
+  // Leap seconds. The fit runs on a continuous count of seconds ("internal" time) so that history stays
+  // linear across a leap. UTC = internal - leap_adj_s, and leap_adj_s changes by leap_change at leap_at_s.
+  int32_t leap_adj_s{0};
+  int8_t leap_change{0};      // +1 insertion, -1 deletion, 0 none pending
+  int64_t leap_at_s{0};       // internal second at which the adjustment takes effect
+  bool leap_announce{false};  // known in advance (UBX-NAV-TIMELS) and due within a day: set LI for clients
 };
 
 class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
@@ -156,6 +162,16 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   ClockModel model_;
   bool utc_trusted_{false};
   bool ubx_seen_{false};
+  // Leap second state, in the loop task; copied into the model on every publish
+  int32_t leap_adj_s_{0};
+  int8_t leap_change_{0};
+  int64_t leap_midnight_unix_{0};  // the UTC midnight the leap belongs to (the 00:00:00 that follows it)
+  bool leap_from_ubx_{false};
+  uint32_t last_timels_poll_ms_{0};
+  int64_t leap_at_internal_() const {
+    return this->leap_midnight_unix_ + this->leap_adj_s_ - (this->leap_change_ < 0 ? 1 : 0);
+  }
+  void fill_leap_(ClockModel &model) const;
   bool require_utc_valid_{false};
   bool ubx_absent_warned_{false};
   bool server_started_{false};

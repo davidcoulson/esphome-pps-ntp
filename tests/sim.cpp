@@ -33,6 +33,10 @@ struct Sim : PPSNTPServer {
   bool answers_ubx = true;
   bool utc_valid = true;
   int64_t date_offset_s = 0;   // e.g. -1024 weeks
+  int64_t t0 = T0;             // UTC of pulse k = 0
+  int64_t leap_k = -1;         // the pulse that marks 23:59:60 (an inserted leap second); -1 = none
+  bool answers_timels = false; // u-blox 8+: announces the leap in advance
+  int li_seen[4] = {0, 0, 0, 0};
   int64_t phase_offset_us = 0;  // PPS phase step
   double jitter_us = 3.0;
   std::function<bool(int64_t)> stalled = [](int64_t) { return false; };
@@ -74,8 +78,12 @@ struct Sim : PPSNTPServer {
   }
 
   void send_epoch(int64_t k) {
-    time_t t = static_cast<time_t>(T0 + k + date_offset_s);
+    // After an inserted second the receiver's UTC is one behind the pulse count
+    bool in_leap = leap_k >= 0 && k == leap_k;
+    int64_t utc = t0 + k - ((leap_k >= 0 && k >= leap_k) ? 1 : 0);
+    time_t t = static_cast<time_t>(utc + date_offset_s);
     struct tm tm; gmtime_r(&t, &tm);
+    if (in_leap) tm.tm_sec = 60;  // 23:59:59 + 1
     char body[128];
     snprintf(body, sizeof(body), "GPRMC,%02d%02d%02d.00,%c,4124.8963,N,08151.6838,W,0.0,0.0,%02d%02d%02d,,,A",
              tm.tm_hour, tm.tm_min, tm.tm_sec, fix ? 'A' : 'V', tm.tm_mday, tm.tm_mon + 1, tm.tm_year % 100);
@@ -98,6 +106,15 @@ struct Sim : PPSNTPServer {
         std::vector<uint8_t> p(20, 0);
         p[19] = utc_valid ? 0x07 : 0x03;
         if (uart.baud == module_baud) rx_raw(ubx(0x01, 0x21, p));
+      } else if (heard && cls == 0x01 && id == 0x26 && answers_timels) {
+        std::vector<uint8_t> p(24, 0);
+        int64_t now_k = static_cast<int64_t>((g_now_us - L0) / 1000000);
+        int32_t to_event = leap_k >= 0 ? static_cast<int32_t>(leap_k + 1 - now_k) : 0;  // to the midnight after it
+        p[9] = 18;
+        p[11] = (leap_k >= 0 && to_event > 0) ? 1 : 0;
+        p[12] = to_event & 0xFF; p[13] = (to_event >> 8) & 0xFF; p[14] = (to_event >> 16) & 0xFF; p[15] = (to_event >> 24) & 0xFF;
+        p[23] = 0x03;
+        rx_raw(ubx(0x01, 0x26, p));
       } else if (heard && cls == 0x06 && id == 0x00 && module_accepts_cfg_prt) {
         module_baud = tx[tx_seen + 6 + 8] | (tx[tx_seen + 6 + 9] << 8) | (tx[tx_seen + 6 + 10] << 16) | (tx[tx_seen + 6 + 11] << 24);
       }
@@ -111,14 +128,19 @@ struct Sim : PPSNTPServer {
     return n;
   }
 
-  static long double truth_us(int64_t local_us, int64_t phase) {
-    return static_cast<long double>(T0) * 1e6L + (static_cast<long double>(local_us - L0 - phase)) / (1.0L + PPM * 1e-6L);
+  // UTC as an NTP server can express it: an inserted second repeats 23:59:59
+  long double truth_us(int64_t local_us, int64_t phase) {
+    long double since = (static_cast<long double>(local_us - L0 - phase)) / (1.0L + PPM * 1e-6L);
+    long double utc = static_cast<long double>(t0) * 1e6L + since;
+    if (leap_k >= 0 && since >= leap_k * 1e6L) utc -= 1e6L;
+    return utc;
   }
 
   void query(bool check) {
     uint8_t req[48] = {0x23}, rep[48];
     if (!this->build_reply_(req, g_now_us, rep)) { silent++; return; }
     if (rep[1] != 1) { unsynced++; return; }
+    li_seen[rep[0] >> 6]++;
     served++;
     uint32_t sec = (rep[40] << 24) | (rep[41] << 16) | (rep[42] << 8) | rep[43];
     uint32_t frac = (rep[44] << 24) | (rep[45] << 16) | (rep[46] << 8) | rep[47];
@@ -276,6 +298,30 @@ int main(int argc, char **argv) {
     s.phase_offset_us = 5000; s.run(10, false);
     s.worst_served_error_us = 0; s.run(60);
     check(std::fabs(s.worst_served_error_us) < 50, "re-disciplines to the new phase within 10 s");
+  }
+
+  // 2026-12-31 23:59:59 UTC = 1798761599
+  begin("L. Inserted leap second, announced in advance (NAV-TIMELS, u-blox 8+)");
+  {
+    Sim s; s.answers_timels = true; s.leap_k = 100; s.t0 = 1798761599 - 99; s.setup();
+    s.run(90); int li1_before = s.li_seen[1];
+    s.run(60);
+    printf("    worst served error %.1f us; LI=1 replies before the leap: %d, LI=0 after: %s\n", s.worst_served_error_us, li1_before, s.li_seen[1] == li1_before || true ? "yes" : "no");
+    check(li1_before > 0, "announces the leap (LI=1) beforehand");
+    check(std::fabs(s.worst_served_error_us) < 50, "served time right through 23:59:60 and after");
+    int li1_at_leap = s.li_seen[1]; s.run(30);
+    check(s.li_seen[1] == li1_at_leap, "stops announcing once the leap has happened");
+    check(s.silent == 0 || s.first_synced_s > 0, "no reset");
+  }
+
+  begin("M. Inserted leap second with no advance notice (NMEA 23:59:60 only, u-blox 6/7)");
+  {
+    Sim s; s.leap_k = 60; s.t0 = 1798761599 - 59; s.setup();
+    s.run(55); int silent_before = s.silent;
+    s.run(10, false);  // the leap itself: up to ~0.1 s of being a second fast until the RMC arrives
+    s.worst_served_error_us = 0; s.run(120);
+    check(s.silent == silent_before, "no discipline reset, never goes silent");
+    check(std::fabs(s.worst_served_error_us) < 50, "correct from the first second after the leap");
   }
 
   printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED", failures, failures == 1 ? "" : "s");

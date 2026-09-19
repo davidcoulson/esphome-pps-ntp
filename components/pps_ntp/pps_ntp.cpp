@@ -40,6 +40,8 @@ static constexpr int64_t FIX_STALE_US = 3000000;      // pulses only count while
 static constexpr int64_t RMC_MAX_DELAY_US = 950000;   // RMC must follow its pulse within this window
 static constexpr uint32_t UBX_POLL_INTERVAL_MS = 10000;
 static constexpr uint32_t UBX_POLL_FAST_MS = 2000;
+static constexpr uint32_t TIMELS_POLL_MS = 60000;
+static constexpr int64_t LEAP_ANNOUNCE_S = 86400;  // NTP convention: set LI during the day that ends with the leap
 static constexpr uint32_t UBX_ABSENT_TIMEOUT_MS = 60000;
 static constexpr uint32_t BAUD_VERIFY_MS = 4000;
 static constexpr uint32_t BAUD_RETRY_MS = 5000;
@@ -68,9 +70,22 @@ static bool all_digits(const char *p, int n) {
   return true;
 }
 
-static int64_t utc_us_at(const ClockModel &model, int64_t local_us) {
+// Internal (continuous) microseconds -> UTC. During an inserted second this repeats 23:59:59, which is
+// how NTP servers conventionally represent 23:59:60.
+static int64_t internal_to_utc_us(const ClockModel &model, int64_t internal_us) {
+  int64_t adj = model.leap_adj_s;
+  if (model.leap_change != 0 && internal_us >= model.leap_at_s * 1000000LL)
+    adj += model.leap_change;
+  return internal_us - adj * 1000000LL;
+}
+
+static int64_t internal_us_at(const ClockModel &model, int64_t local_us) {
   double elapsed = static_cast<double>(local_us - model.anchor_local_us) * (1e6 / model.local_us_per_s);
   return model.anchor_utc_s * 1000000LL + llround(elapsed);
+}
+
+static int64_t utc_us_at(const ClockModel &model, int64_t local_us) {
+  return internal_to_utc_us(model, internal_us_at(model, local_us));
 }
 
 static void put_be32(uint8_t *p, uint32_t v) {
@@ -144,6 +159,20 @@ void PPSNTPServer::loop() {
     this->last_ubx_poll_ms_ = now_ms;
     this->send_ubx_(0x01, 0x21, nullptr, 0);  // poll UBX-NAV-TIMEUTC for the validUTC flag
   }
+  // Leap-second schedule (u-blox 8 and later; older receivers don't answer, and the leap is then taken from NMEA)
+  if (this->utc_trusted_ && now_ms - this->last_timels_poll_ms_ >= TIMELS_POLL_MS) {
+    this->last_timels_poll_ms_ = now_ms;
+    this->send_ubx_(0x01, 0x26, nullptr, 0);
+  }
+  // Once a leap is well behind us, fold it into the running adjustment
+  if (this->leap_change_ != 0 && this->hist_count_ > 0 && this->last_accepted_utc_s_ > this->leap_at_internal_() + 10) {
+    this->leap_adj_s_ += this->leap_change_;
+    this->leap_change_ = 0;
+    this->leap_from_ubx_ = false;
+    this->publish_model_();
+    ESP_LOGI(TAG, "Leap second complete");
+  }
+
   if (!this->ubx_seen_ && !this->utc_trusted_ && !this->ubx_absent_warned_ &&
       now_ms - this->boot_ms_ >= UBX_ABSENT_TIMEOUT_MS) {
     this->ubx_absent_warned_ = true;
@@ -460,6 +489,7 @@ void PPSNTPServer::accept_pulse_(int64_t local_us, int64_t utc_s) {
   next.local_us_per_s = rate;
   next.last_pulse_local_us = local_us;
   next.utc_trusted = this->utc_trusted_;
+  this->fill_leap_(next);
   portENTER_CRITICAL(&this->lock_);
   this->model_ = next;
   portEXIT_CRITICAL(&this->lock_);
@@ -474,14 +504,28 @@ void PPSNTPServer::reset_discipline_(const char *reason) {
   this->label_confirmations_ = 0;
   this->off_second_edges_ = 0;
   this->jitter_sq_us_ = 0;
+  if (this->leap_change_ == 0)
+    this->leap_adj_s_ = 0;  // no history left that was labelled with it
   portENTER_CRITICAL(&this->lock_);
   this->model_.valid = false;
   portEXIT_CRITICAL(&this->lock_);
 }
 
+void PPSNTPServer::fill_leap_(ClockModel &model) const {
+  model.leap_adj_s = this->leap_adj_s_;
+  model.leap_change = this->leap_change_;
+  model.leap_at_s = this->leap_change_ != 0 ? this->leap_at_internal_() : 0;
+  int64_t now_unix = this->last_accepted_utc_s_ - this->leap_adj_s_;
+  model.leap_announce = this->leap_change_ != 0 && this->leap_from_ubx_ &&
+                        this->leap_midnight_unix_ - now_unix <= LEAP_ANNOUNCE_S;
+}
+
 void PPSNTPServer::publish_model_() {
+  ClockModel next = this->model_;
+  next.utc_trusted = this->utc_trusted_;
+  this->fill_leap_(next);
   portENTER_CRITICAL(&this->lock_);
-  this->model_.utc_trusted = this->utc_trusted_;
+  this->model_ = next;
   portEXIT_CRITICAL(&this->lock_);
 }
 
@@ -612,6 +656,9 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
   int hour = two_digits(time), minute = two_digits(time + 2), second = two_digits(time + 4);
   if (day < 1 || day > 31 || month < 1 || month > 12 || hour > 23 || minute > 59 || second > 60)
     return;
+  bool leap_second_now = second == 60;  // 23:59:60, an inserted leap second in progress
+  if (leap_second_now && (hour != 23 || minute != 59))
+    return;
   int64_t utc_s = days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
 
   // Old and clone receivers that mishandle the 10-bit GPS week number report a date exactly a multiple of
@@ -630,6 +677,22 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
     }
   }
   this->last_rmc_valid_us_ = now_us;
+
+  // From here on utc_s is "internal" time: UTC plus the leap seconds that have gone by while we've been
+  // running, so that it keeps counting one per pulse across a leap.
+  if (leap_second_now && this->leap_change_ == 0) {
+    // No advance notice (u-blox 6/7 have no NAV-TIMELS): take it from the receiver's own 23:59:60
+    this->leap_change_ = 1;
+    this->leap_midnight_unix_ = utc_s;  // 23:59:60 converts to the following midnight
+    this->leap_from_ubx_ = false;
+    this->publish_model_();
+    ESP_LOGW(TAG, "Receiver reports 23:59:60: inserting a leap second now (no advance notice was available)");
+  }
+  if (this->leap_change_ != 0 && !leap_second_now && utc_s >= this->leap_midnight_unix_) {
+    utc_s += this->leap_adj_s_ + this->leap_change_;
+  } else {
+    utc_s += this->leap_adj_s_;
+  }
 
   // A u-blox receiver sends the RMC for an epoch shortly after that epoch's pulse
   int64_t age = now_us - this->last_pulse_us_;
@@ -660,6 +723,23 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
 void PPSNTPServer::handle_ubx_(uint8_t msg_class, uint8_t msg_id, const uint8_t *payload, uint16_t len) {
   this->ubx_seen_ = true;
   this->ubx_frames_++;
+  if (msg_class == 0x01 && msg_id == 0x26 && len >= 24) {  // NAV-TIMELS
+    int8_t change = static_cast<int8_t>(payload[11]);
+    int32_t to_event = static_cast<int32_t>(payload[12] | (payload[13] << 8) | (payload[14] << 16) |
+                                            (static_cast<uint32_t>(payload[15]) << 24));
+    bool valid = (payload[23] & 0x02) != 0;  // validTimeToLsEvent
+    if (valid && (change == 1 || change == -1) && to_event > 0 && this->hist_count_ > 0 && this->leap_change_ == 0) {
+      // The event is a UTC midnight; rounding removes any doubt about which edge of the leap it counts to
+      int64_t now_unix = this->last_accepted_utc_s_ - this->leap_adj_s_;
+      this->leap_midnight_unix_ = ((now_unix + to_event + 43200) / 86400) * 86400;
+      this->leap_change_ = change;
+      this->leap_from_ubx_ = true;
+      this->publish_model_();
+      ESP_LOGW(TAG, "Leap second scheduled: %+d at unix %lld (in %ld s)", change,
+               static_cast<long long>(this->leap_midnight_unix_), static_cast<long>(to_event));
+    }
+    return;
+  }
   if (msg_class != 0x01 || msg_id != 0x21 || len < 20)
     return;
   bool valid_utc = (payload[19] & 0x04) != 0;  // NAV-TIMEUTC valid.validUTC: leap seconds are known
@@ -776,14 +856,21 @@ bool PPSNTPServer::build_reply_(const uint8_t *request, int64_t rx_local_us, uin
   double dispersion_us = DISPERSION_BASE_US + HOLDOVER_DRIFT_PPM * age_s;
 
   memset(reply, 0, 48);
-  reply[0] = ((synced ? 0 : 3) << 6) | (version << 3) | 4;  // LI, VN, mode = server
+  // LI: 3 = unsynchronised; 1/2 = the last minute of today has 61/59 seconds
+  uint8_t li = 0;
+  if (!synced) {
+    li = 3;
+  } else if (model.leap_announce && internal_us_at(model, rx_local_us) < model.leap_at_s * 1000000LL) {
+    li = model.leap_change > 0 ? 1 : 2;
+  }
+  reply[0] = (li << 6) | (version << 3) | 4;  // LI, VN, mode = server
   reply[1] = synced ? 1 : 16;
   reply[2] = request[2];  // poll
   // Precision: hardware capture ~1 us (2^-20 s); the GPIO interrupt adds a few us of latency jitter (2^-18)
   reply[3] = static_cast<uint8_t>(this->hw_capture_ ? -20 : -18);
   put_be32(reply + 8, static_cast<uint32_t>(std::min(dispersion_us * 65536.0 / 1e6, 4294967295.0)));
   memcpy(reply + 12, this->refid_, 4);
-  put_ntp_timestamp(reply + 16, model.anchor_utc_s * 1000000LL);
+  put_ntp_timestamp(reply + 16, internal_to_utc_us(model, model.anchor_utc_s * 1000000LL));
   memcpy(reply + 24, request + 40, 8);  // originate = client's transmit
   put_ntp_timestamp(reply + 32, utc_us_at(model, rx_local_us));
   put_ntp_timestamp(reply + 40, utc_us_at(model, esp_timer_get_time()));  // last: as close to the send as we get

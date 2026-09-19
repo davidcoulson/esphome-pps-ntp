@@ -40,11 +40,14 @@ class GNSSSim : public Component {
   void inject_glitch() { this->glitch_requested_ = true; }  // a stray edge 50 ms after the next pulse
   void step_phase_us(int32_t us) { this->phase_step_us_ += us; }  // every later pulse moves by this much
   void step_time_s(int32_t s) { this->epoch_offset_s_ += s; }  // the reported time jumps; pulses don't
+  void set_answer_timels(bool on) { this->answer_timels_ = on; }  // u-blox 8+ announce leap seconds; 6/7 don't
+  // Jump the reported date to a 31 December so that 23:59:60 happens this many seconds from now
+  void arm_leap(uint32_t seconds_from_now);
 
  protected:
   static void pulse_cb(void *arg);
   void start_();
-  void send_epoch_(int64_t utc_s);
+  void send_epoch_(uint32_t pulse);
   void send_nmea_(const std::string &body);
   void send_ubx_(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t len);
   void read_commands_();
@@ -63,7 +66,9 @@ class GNSSSim : public Component {
   bool glitch_requested_{false};
   std::atomic<int32_t> phase_step_us_{0};
   int64_t deadline_us_{0};
-  int32_t epoch_offset_s_{0};
+  int64_t epoch_offset_s_{0};
+  bool answer_timels_{false};
+  uint32_t leap_pulse_{0};  // the pulse that marks 23:59:60; 0 = none
 
   bool started_{false};
   esp_timer_handle_t timer_{nullptr};

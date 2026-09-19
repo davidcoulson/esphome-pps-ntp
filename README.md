@@ -25,7 +25,11 @@ GNSS UART ─► NMEA RMC (which second) ┤
    - Dates before 2026 are treated as a GPS week-number rollover (old and clone receivers) and moved forward by whole multiples of 1024 weeks.
 3. **Discipline.** A least-squares fit over the last 64 pulses gives the crystal's rate and phase. The ESP32 system clock is left alone; NTP timestamps are computed straight from the fit.
 4. **Leap-second safety.** The receiver is polled with `UBX-NAV-TIMEUTC`, and the server reports itself as unsynchronised until the receiver confirms UTC is valid. (After a cold start, u-blox receivers can report time with the wrong leap-second count for up to about 12.5 minutes.) Receivers that don't answer UBX fall back to NMEA-only after 60 s.
-5. **Serving.** A dedicated FreeRTOS task, pinned to the core the ESPHome loop isn't using, answers NTPv3 and NTPv4 client requests. It timestamps each request as soon as it arrives and each reply just before sending.
+5. **Leap seconds.** The fit runs on a continuous count of seconds, so its history stays linear across a leap, and UTC is derived from it with an adjustment that changes by one at the leap.
+   - **u-blox 8 and later:** the schedule comes from `UBX-NAV-TIMELS`. Clients get LI=1 (or 2) during the final day, and the step happens exactly at midnight. An inserted second is served as a repeat of 23:59:59, as NTP servers conventionally do.
+   - **u-blox 6/7 (no NAV-TIMELS):** the leap is taken from the receiver's own `23:59:60` sentence. There is no advance LI, and for roughly 0.1 s (until that sentence arrives) replies are one second fast.
+   - Either way the fit is not reset and the server doesn't go silent.
+6. **Serving.** A dedicated FreeRTOS task, pinned to the core the ESPHome loop isn't using, answers NTPv3 and NTPv4 client requests. It timestamps each request as soon as it arrives and each reply just before sending.
    - **Synced:** stratum 1, refid `GPS` (configurable). The precision field is 2^-20 s (about 1 µs) with hardware capture and 2^-18 s with the GPIO interrupt.
    - **PPS lost:** keeps serving on the local crystal for `holdover` (stratum 1, with dispersion growing over time).
    - **After holdover:** replies with LI=3 and stratum 16.
@@ -55,7 +59,7 @@ Wiring (example config):
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.2.3
+  - source: github://davidcoulson/esphome-pps-ntp@v0.3.0
     components: [pps_ntp]
 
 uart:
@@ -129,7 +133,7 @@ At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports wh
 
 ## Tests
 
-`tests/run.sh` builds the component against stub headers on the host and runs it against a scripted receiver: a normal start with a baud switch, a receiver already at the target baud, glitch edges, a stalled loop with a lost sentence at the first label, a GPS week rollover, an oversized UBX frame, a receiver without UBX (with and without `require_utc_valid`), a cold start with UTC not yet valid, loss of fix, a 20-minute outage, and a 5 ms PPS phase step. Each scenario checks the time the server would hand out against the simulated truth. It exercises the logic only; it says nothing about real capture jitter or network delay.
+`tests/run.sh` builds the component against stub headers on the host and runs it against a scripted receiver: a normal start with a baud switch, a receiver already at the target baud, glitch edges, a stalled loop with a lost sentence at the first label, a GPS week rollover, an oversized UBX frame, a receiver without UBX (with and without `require_utc_valid`), a cold start with UTC not yet valid, loss of fix, a 20-minute outage, a 5 ms PPS phase step, and an inserted leap second both with and without advance notice. Each scenario checks the time the server would hand out against the simulated truth. It exercises the logic only; it says nothing about real capture jitter or network delay.
 
 ## Testing without a receiver: `gnss_sim`
 
@@ -140,7 +144,7 @@ At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports wh
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.2.3
+  - source: github://davidcoulson/esphome-pps-ntp@v0.3.0
     components: [pps_ntp, gnss_sim]
 
 gnss_sim:
@@ -151,7 +155,7 @@ gnss_sim:
   ppm: 12
 ```
 
-Faults can be injected from lambdas: `set_pps_enabled`, `set_nmea_enabled`, `set_fix`, `set_utc_valid`, `set_answer_ubx`, `set_week_rollover`, `inject_glitch`, `step_phase_us`, `step_time_s`.
+Faults can be injected from lambdas: `set_pps_enabled`, `set_nmea_enabled`, `set_fix`, `set_utc_valid`, `set_answer_ubx`, `set_week_rollover`, `inject_glitch`, `step_phase_us`, `step_time_s`, `set_answer_timels` and `arm_leap(seconds)` (the reported date jumps to 31 December and `23:59:60` follows).
 
 The time it reports is the node's own system clock at start-up (so the node needs a `time:` source), free-running after that. **Never point real NTP clients at a node fed by the emulator.**
 
@@ -168,7 +172,7 @@ chronyc sources -v              # after adding "server <device-ip> iburst" to ch
 ## Limitations
 
 - IPv4 only.
-- No leap-second announcements (the LI bits are never set to 1 or 2).
+- Leap seconds are only announced in advance (LI bits) with a receiver that supports `UBX-NAV-TIMELS` (u-blox 8 and later).
 - NTP packet timestamps are taken in the socket task, not in hardware. On SPI Ethernet (W5500) that means roughly 50–200 µs of asymmetry, from the chip's interrupt, the SPI frame read and lwIP. This dominates the error budget: PPS capture is accurate to about 1 µs. It's far better than Wi-Fi or internet NTP, but not PTP-grade. An RMII MAC (for example ESP32-P4 or a classic ESP32 with a LAN8720) shortens this path.
 - Assumes the receiver's PPS rising edge marks the start of the UTC second (the u-blox default).
 
