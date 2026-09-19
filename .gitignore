@@ -1,0 +1,5 @@
+.esphome/
+secrets.yaml
+compile.log
+gps-ntp.yaml
+__pycache__/

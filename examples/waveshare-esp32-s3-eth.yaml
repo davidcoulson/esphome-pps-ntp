@@ -1,0 +1,72 @@
+# GPS-disciplined stratum-1 NTP server on a Waveshare ESP32-S3-ETH (W5500, PoE)
+# GNSS: u-blox NEO-7M (or any u-blox / clone with a 3.3 V PPS output)
+#
+# Wiring (camera connector unused, so its pins are free):
+#   GNSS TX  -> GPIO17
+#   GNSS RX  -> GPIO16
+#   GNSS PPS -> GPIO15
+#   GNSS VCC -> 3V3, GND -> GND
+
+substitutions:
+  name: gps-ntp
+  gnss_rx_pin: GPIO17
+  gnss_tx_pin: GPIO16
+  pps_pin: GPIO15
+
+esphome:
+  name: ${name}
+  friendly_name: GPS NTP Server
+
+esp32:
+  variant: esp32s3
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+external_components:
+  - source: github://davidcoulson/esphome-pps-ntp
+    components: [pps_ntp]
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+ethernet:
+  type: W5500
+  clk_pin: GPIO13
+  mosi_pin: GPIO11
+  miso_pin: GPIO12
+  cs_pin: GPIO14
+  interrupt_pin: GPIO10
+  reset_pin: GPIO9
+
+uart:
+  id: gnss_uart
+  rx_pin: ${gnss_rx_pin}
+  tx_pin: ${gnss_tx_pin}
+  baud_rate: 9600          # the module's factory baud
+  rx_buffer_size: 1024
+
+pps_ntp:
+  uart_id: gnss_uart
+  pps_pin: ${pps_pin}
+  gnss_baud_rate: 115200   # raised at boot with UBX-CFG-PRT
+  holdover: 15min
+  update_interval: 60s
+  satellites:
+    name: Satellites
+  frequency_offset:
+    name: Crystal Offset
+  pps_jitter:
+    name: PPS Jitter
+  requests:
+    name: NTP Requests
+  synced:
+    name: GPS Synced
