@@ -10,6 +10,7 @@
 #include <lwip/sockets.h>
 #include <unistd.h>
 
+#include "esphome/components/network/util.h"
 #include "esphome/core/log.h"
 
 namespace esphome::pps_ntp {
@@ -83,14 +84,20 @@ void PPSNTPServer::setup() {
   this->original_baud_ = this->parent_->get_baud_rate();
   if (this->gnss_baud_rate_ != 0 && this->gnss_baud_rate_ != this->original_baud_)
     this->start_baud_switch_();
-
-  if (xTaskCreate(PPSNTPServer::ntp_task, "pps_ntp", 4096, this, 10, &this->task_) != pdPASS) {
-    ESP_LOGE(TAG, "Could not start NTP server task");
-    this->mark_failed();
-  }
 }
 
 void PPSNTPServer::loop() {
+  // The socket API needs lwIP's tcpip thread, which the network component only brings up after
+  // our setup(); calling socket() earlier asserts on an uninitialised lwIP mutex
+  if (this->task_ == nullptr && network::is_connected()) {
+    if (xTaskCreate(PPSNTPServer::ntp_task, "pps_ntp", 4096, this, 10, &this->task_) != pdPASS) {
+      ESP_LOGE(TAG, "Could not start NTP server task");
+      this->mark_failed();
+      return;
+    }
+    ESP_LOGI(TAG, "Network up; serving NTP on UDP port %u", this->port_);
+  }
+
   uint8_t byte;
   while (this->available() > 0 && this->read_byte(&byte))
     this->feed_byte_(byte);
