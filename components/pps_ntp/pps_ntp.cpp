@@ -945,15 +945,30 @@ void PPSNTPServer::ntp_task(void *arg) { static_cast<PPSNTPServer *>(arg)->ntp_l
 
 void PPSNTPServer::ntp_loop_() {
   for (;;) {
+    // One dual-stack socket when the build has IPv6 (`network: enable_ipv6: true`): IPv4 clients then
+    // show up as v4-mapped addresses, and replying to the source address works for both.
+#if LWIP_IPV6
+    int sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+#else
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+#endif
     if (sock < 0) {
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
+#if LWIP_IPV6
+    int v6only = 0;
+    setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+    struct sockaddr_in6 addr {};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = htons(this->port_);
+    addr.sin6_addr = in6addr_any;
+#else
     struct sockaddr_in addr {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(this->port_);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
+#endif
     if (bind(sock, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0) {
       close(sock);
       vTaskDelay(pdMS_TO_TICKS(1000));
@@ -962,7 +977,7 @@ void PPSNTPServer::ntp_loop_() {
 
     for (;;) {
       uint8_t request[68];
-      struct sockaddr_in source {};
+      struct sockaddr_storage source {};  // large enough for either family
       socklen_t source_len = sizeof(source);
       int received = recvfrom(sock, request, sizeof(request), 0, reinterpret_cast<struct sockaddr *>(&source),
                               &source_len);

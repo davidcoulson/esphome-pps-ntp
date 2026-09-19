@@ -16,14 +16,16 @@ def ts(b):
     s, f = struct.unpack("!II", b)
     return s - NTP_DELTA + f / 2**32
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+# Works for names, IPv4 and IPv6 literals (link-local needs a zone: fe80::1%en0)
+family, _, _, _, dest = socket.getaddrinfo(host, 123, type=socket.SOCK_DGRAM)[0]
+sock = socket.socket(family, socket.SOCK_DGRAM)
 sock.settimeout(1.0)
 rtts, procs, offsets, lost, last = [], [], [], 0, None
 for _ in range(count):
     t1 = time.time()
     pkt = b"\x23" + bytes(39) + struct.pack("!II", int(t1) + NTP_DELTA, int((t1 % 1) * 2**32))
     p1 = time.perf_counter()
-    sock.sendto(pkt, (host, 123))
+    sock.sendto(pkt, dest)
     try:
         data, _ = sock.recvfrom(128)
     except socket.timeout:

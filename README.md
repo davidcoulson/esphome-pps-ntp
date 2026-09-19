@@ -59,7 +59,7 @@ Wiring (example config):
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.3.1
+  - source: github://davidcoulson/esphome-pps-ntp@v0.3.2
     components: [pps_ntp]
 
 uart:
@@ -144,7 +144,7 @@ At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports wh
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.3.1
+  - source: github://davidcoulson/esphome-pps-ntp@v0.3.2
     components: [pps_ntp, gnss_sim]
 
 gnss_sim:
@@ -171,7 +171,7 @@ chronyc sources -v              # after adding "server <device-ip> iburst" to ch
 
 ## Limitations
 
-- IPv4 only.
+- IPv6 needs `network: enable_ipv6: true` in the node's config, which compiles IPv6 into lwIP. Both transports then answer on IPv4 and IPv6 (the socket transport with one dual-stack socket).
 - Leap seconds are only announced in advance (LI bits) with a receiver that supports `UBX-NAV-TIMELS` (u-blox 8 and later).
 - NTP packet timestamps are taken in software, not by the Ethernet hardware, so whatever the network path inside the node costs is invisible to them. Measured on an ESP32-S3-ETH (W5500 over SPI) from a wired host one router hop away, 400 requests per run:
 
