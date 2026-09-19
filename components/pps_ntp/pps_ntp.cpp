@@ -12,7 +12,13 @@
 #include <unistd.h>
 
 #include "esphome/components/network/util.h"
+#include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
+
+#ifdef USE_PPS_NTP_RAW_UDP
+#include <lwip/pbuf.h>
+#include <lwip/udp.h>
+#endif
 
 #if defined(USE_PPS_NTP_TASK_CORE) && CONFIG_FREERTOS_NUMBER_OF_CORES < 2
 #error "pps_ntp: task_core is set, but this build has a single FreeRTOS core"
@@ -23,11 +29,17 @@ namespace esphome::pps_ntp {
 static const char *const TAG = "pps_ntp";
 
 static constexpr int MIN_PULSES_FOR_SYNC = 4;
+static constexpr uint8_t MIN_LABEL_CONFIRMATIONS = 3;  // RMCs that must agree with the pulse count before serving
+static constexpr uint8_t MAX_OFF_SECOND_EDGES = 3;     // consecutive misaligned edges before re-labelling
+static constexpr int64_t MIN_VALID_UTC_S = 1767225600;       // 2026-01-01: nothing older can be a live fix
+static constexpr int64_t GPS_WEEK_ROLLOVER_S = 619315200;    // 1024 weeks
+static constexpr uint32_t BAUD_PROBE_MS = 1500;
 static constexpr double MAX_RATE_ERROR_PPM = 500.0;   // reject fits that imply a broken crystal
 static constexpr int64_t MAX_PULSE_GAP_S = 600;       // longer gaps are relabelled from NMEA
 static constexpr int64_t FIX_STALE_US = 3000000;      // pulses only count while the receiver reports a fix
 static constexpr int64_t RMC_MAX_DELAY_US = 950000;   // RMC must follow its pulse within this window
 static constexpr uint32_t UBX_POLL_INTERVAL_MS = 10000;
+static constexpr uint32_t UBX_POLL_FAST_MS = 2000;
 static constexpr uint32_t UBX_ABSENT_TIMEOUT_MS = 60000;
 static constexpr uint32_t BAUD_VERIFY_MS = 4000;
 static constexpr uint32_t BAUD_RETRY_MS = 5000;
@@ -84,35 +96,33 @@ void PPSNTPServer::setup() {
   this->boot_ms_ = millis();
   this->hist_local_.assign(this->fit_window_, 0);
   this->hist_utc_.assign(this->fit_window_, 0);
+  // Always apply the YAML pin mode (pull-up/down); MCPWM only routes the pad to its capture input
+  this->pps_pin_->setup();
   this->hw_capture_ = this->setup_capture_();
-  if (!this->hw_capture_) {
-    this->pps_pin_->setup();
+  if (!this->hw_capture_)
     this->pps_pin_->attach_interrupt(PPSNTPServer::pps_isr, this, gpio::INTERRUPT_RISING_EDGE);
-  }
 
   this->original_baud_ = this->parent_->get_baud_rate();
-  if (this->gnss_baud_rate_ != 0 && this->gnss_baud_rate_ != this->original_baud_)
-    this->start_baud_switch_();
+  if (this->gnss_baud_rate_ != 0 && this->gnss_baud_rate_ != this->original_baud_) {
+    // The receiver keeps its baud across our reboots (and in BBR/flash), so listen at the target first.
+    // Only if that stays quiet do we send CFG-PRT at the original baud and save the result.
+    this->parent_->set_baud_rate(this->gnss_baud_rate_);
+    this->parent_->load_settings(false);
+    this->nmea_ok_since_switch_ = false;
+    this->baud_deadline_ms_ = millis() + BAUD_PROBE_MS;
+    this->baud_state_ = BaudState::PROBE;
+  }
 }
 
 void PPSNTPServer::loop() {
   // The socket API needs lwIP's tcpip thread, which the network component only brings up after
   // our setup(); calling socket() earlier asserts on an uninitialised lwIP mutex
-  if (this->task_ == nullptr && network::is_connected()) {
-    // Run on the core the ESPHome loop isn't on, so request timestamps don't wait out its critical sections
-#if defined(USE_PPS_NTP_TASK_CORE)
-    BaseType_t core = USE_PPS_NTP_TASK_CORE;
-#elif CONFIG_FREERTOS_NUMBER_OF_CORES > 1
-    BaseType_t core = xPortGetCoreID() == 0 ? 1 : 0;
-#else
-    BaseType_t core = tskNO_AFFINITY;
-#endif
-    if (xTaskCreatePinnedToCore(PPSNTPServer::ntp_task, "pps_ntp", 4096, this, 10, &this->task_, core) != pdPASS) {
-      ESP_LOGE(TAG, "Could not start NTP server task");
+  if (!this->server_started_ && network::is_connected()) {
+    if (!this->start_server_()) {
       this->mark_failed();
       return;
     }
-    ESP_LOGI(TAG, "Network up; serving NTP on UDP port %u (core %d)", this->port_, static_cast<int>(core));
+    this->server_started_ = true;
   }
 
   // Pulses before NMEA: the RMC that labels a pulse must find that pulse already recorded
@@ -129,14 +139,21 @@ void PPSNTPServer::loop() {
   this->service_baud_switch_();
 
   uint32_t now_ms = millis();
-  if (now_ms - this->last_ubx_poll_ms_ >= UBX_POLL_INTERVAL_MS) {
+  // Poll quickly until UTC is confirmed, so a warm receiver isn't held at stratum 16 for a full interval
+  if (now_ms - this->last_ubx_poll_ms_ >= (this->utc_trusted_ ? UBX_POLL_INTERVAL_MS : UBX_POLL_FAST_MS)) {
     this->last_ubx_poll_ms_ = now_ms;
     this->send_ubx_(0x01, 0x21, nullptr, 0);  // poll UBX-NAV-TIMEUTC for the validUTC flag
   }
-  if (!this->ubx_seen_ && !this->utc_trusted_ && now_ms - this->boot_ms_ >= UBX_ABSENT_TIMEOUT_MS) {
-    ESP_LOGW(TAG, "Receiver does not answer UBX polls; trusting NMEA UTC without leap-second confirmation");
-    this->utc_trusted_ = true;
-    this->publish_model_();
+  if (!this->ubx_seen_ && !this->utc_trusted_ && !this->ubx_absent_warned_ &&
+      now_ms - this->boot_ms_ >= UBX_ABSENT_TIMEOUT_MS) {
+    this->ubx_absent_warned_ = true;
+    if (this->require_utc_valid_) {
+      ESP_LOGW(TAG, "Receiver does not answer UBX polls and require_utc_valid is set; staying unsynchronised");
+    } else {
+      ESP_LOGW(TAG, "Receiver does not answer UBX polls; trusting NMEA UTC without leap-second confirmation");
+      this->utc_trusted_ = true;
+      this->publish_model_();
+    }
   }
 
   bool synced = this->is_synced_(this->model_, esp_timer_get_time());
@@ -169,25 +186,37 @@ bool PPSNTPServer::setup_capture_() {
   channel_config.gpio_num = this->pps_pin_->get_pin();
   channel_config.prescale = 1;
   channel_config.flags.pos_edge = true;
+  channel_config.flags.invert_cap_signal = this->pps_pin_->is_inverted();  // `inverted: true` = active-low PPS
   esp_err_t err = mcpwm_new_capture_channel(this->cap_timer_, &channel_config, &this->cap_pps_);
   if (err == ESP_OK) {
     channel_config.gpio_num = -1;  // software trigger only
+    channel_config.flags.invert_cap_signal = false;
     err = mcpwm_new_capture_channel(this->cap_timer_, &channel_config, &this->cap_ref_);
   }
   // No callbacks are registered, so the driver never installs an interrupt; loop() polls the latches
+  bool pps_enabled = false, ref_enabled = false, timer_enabled = false, timer_started = false;
   if (err == ESP_OK)
-    err = mcpwm_capture_channel_enable(this->cap_pps_);
+    pps_enabled = (err = mcpwm_capture_channel_enable(this->cap_pps_)) == ESP_OK;
   if (err == ESP_OK)
-    err = mcpwm_capture_channel_enable(this->cap_ref_);
+    ref_enabled = (err = mcpwm_capture_channel_enable(this->cap_ref_)) == ESP_OK;
   if (err == ESP_OK)
-    err = mcpwm_capture_timer_enable(this->cap_timer_);
+    timer_enabled = (err = mcpwm_capture_timer_enable(this->cap_timer_)) == ESP_OK;
   if (err == ESP_OK)
-    err = mcpwm_capture_timer_start(this->cap_timer_);
+    timer_started = (err = mcpwm_capture_timer_start(this->cap_timer_)) == ESP_OK;
   uint32_t resolution_hz = 0;
   if (err == ESP_OK)
     err = mcpwm_capture_timer_get_resolution(this->cap_timer_, &resolution_hz);
   if (err != ESP_OK || resolution_hz == 0) {
     ESP_LOGW(TAG, "MCPWM capture setup failed (%s); falling back to the GPIO interrupt", esp_err_to_name(err));
+    // The driver refuses to delete anything that is still enabled
+    if (timer_started)
+      mcpwm_capture_timer_stop(this->cap_timer_);
+    if (timer_enabled)
+      mcpwm_capture_timer_disable(this->cap_timer_);
+    if (ref_enabled)
+      mcpwm_capture_channel_disable(this->cap_ref_);
+    if (pps_enabled)
+      mcpwm_capture_channel_disable(this->cap_pps_);
     if (this->cap_pps_ != nullptr)
       mcpwm_del_capture_channel(this->cap_pps_);
     if (this->cap_ref_ != nullptr)
@@ -215,12 +244,11 @@ void PPSNTPServer::poll_capture_() {
 
   // Latch the capture timer "now" between two esp_timer reads, with nothing able to preempt us,
   // to place the hardware-captured edge on the esp_timer timeline
-  static portMUX_TYPE ref_lock = portMUX_INITIALIZER_UNLOCKED;
-  portENTER_CRITICAL(&ref_lock);
+  portENTER_CRITICAL(&this->ref_lock_);
   int64_t before_us = esp_timer_get_time();
   mcpwm_capture_channel_trigger_soft_catch(this->cap_ref_);
   int64_t after_us = esp_timer_get_time();
-  portEXIT_CRITICAL(&ref_lock);
+  portEXIT_CRITICAL(&this->ref_lock_);
   uint32_t ref_ticks;
   mcpwm_capture_get_latched_value(this->cap_ref_, &ref_ticks);
 
@@ -253,10 +281,35 @@ void PPSNTPServer::update() {
     this->frequency_offset_sensor_->publish_state(model.local_us_per_s - 1e6);
   if (this->pps_jitter_sensor_ != nullptr && model.valid)
     this->pps_jitter_sensor_->publish_state(std::sqrt(this->jitter_sq_us_));
+  // A float holds integers exactly up to 2^24; wrap there and let total_increasing treat it as a meter reset
   if (this->requests_sensor_ != nullptr)
-    this->requests_sensor_->publish_state(this->requests_.load());
+    this->requests_sensor_->publish_state(this->requests_.load() & 0xFFFFFF);
   if (this->synced_binary_sensor_ != nullptr)
     this->synced_binary_sensor_->publish_state(this->last_synced_);
+  this->log_status_();
+}
+
+void PPSNTPServer::log_status_() {
+  // A dead input is otherwise silent: nothing arrives, so nothing else would ever log
+  if (this->edges_seen_ == this->status_edges_)
+    ESP_LOGW(TAG, "No PPS edges since the last update; check the PPS wiring and that the receiver has a fix");
+  if (this->nmea_ok_ == this->status_nmea_ && this->baud_state_ != BaudState::PROBE &&
+      this->baud_state_ != BaudState::VERIFY && this->baud_state_ != BaudState::RETRY_WAIT) {
+    ESP_LOGW(TAG, "No valid NMEA since the last update (%u checksum failures so far); check TX/RX wiring and baud",
+             static_cast<unsigned>(this->nmea_bad_));
+  }
+  this->status_edges_ = this->edges_seen_;
+  this->status_nmea_ = this->nmea_ok_;
+
+  unsigned stack_free = this->task_ != nullptr ? uxTaskGetStackHighWaterMark(this->task_) : 0;
+  ESP_LOGD(TAG,
+           "edges=%u accepted=%u nmea=%u/%u bad ubx=%u utc_valid=%s fit=%d/%d confirmed=%u residual=%.1fus "
+           "jitter=%.1fus sats=%d stack_free=%u",
+           static_cast<unsigned>(this->edges_seen_), static_cast<unsigned>(this->pulses_accepted_),
+           static_cast<unsigned>(this->nmea_ok_), static_cast<unsigned>(this->nmea_bad_),
+           static_cast<unsigned>(this->ubx_frames_), YESNO(this->utc_trusted_), this->hist_count_, this->fit_window_,
+           static_cast<unsigned>(this->label_confirmations_), this->last_residual_us_, std::sqrt(this->jitter_sq_us_),
+           this->satellites_, stack_free);
 }
 
 void PPSNTPServer::dump_config() {
@@ -276,9 +329,15 @@ void PPSNTPServer::dump_config() {
                 "  Holdover: %us\n"
                 "  Fit window: %d pulses\n"
                 "  Max residual: %.0f µs\n"
-                "  Refid: %.4s",
+                "  Refid: %.4s\n"
+                "  Require UTC valid: %s",
                 this->port_, static_cast<unsigned>(this->holdover_us_ / 1000000), this->fit_window_,
-                this->max_residual_us_, this->refid_);
+                this->max_residual_us_, this->refid_, YESNO(this->require_utc_valid_));
+#ifdef USE_PPS_NTP_RAW_UDP
+  ESP_LOGCONFIG(TAG, "  Transport: raw lwIP (experimental)");
+#else
+  ESP_LOGCONFIG(TAG, "  Transport: socket task");
+#endif
 #ifdef USE_PPS_NTP_TASK_CORE
   ESP_LOGCONFIG(TAG, "  Task core: %d (pinned)", USE_PPS_NTP_TASK_CORE);
 #endif
@@ -298,33 +357,42 @@ void PPSNTPServer::dump_config() {
 // Clock discipline
 
 void PPSNTPServer::handle_pulse_(int64_t local_us) {
-  this->last_pulse_us_ = local_us;
-  this->last_pulse_labelled_ = false;
+  this->edges_seen_++;
 
   // Without a fix the receiver's pulse is free-running; hold over on the local crystal instead
   bool fix_recent = this->last_rmc_valid_us_ != 0 && local_us - this->last_rmc_valid_us_ < FIX_STALE_US;
-  if (this->hist_count_ == 0 || !fix_recent)
-    return;  // the next valid RMC labels this pulse
-
-  // Label by counting whole seconds since the last accepted pulse
-  double rate = this->model_.valid ? this->model_.local_us_per_s : 1e6;
-  int64_t elapsed = local_us - this->last_accepted_local_us_;
-  int64_t seconds = llround(elapsed / rate);
-  if (seconds < 1)
-    return;  // spurious edge
-  if (seconds > MAX_PULSE_GAP_S) {
-    this->reset_discipline_("PPS gap too long");
-    return;
+  if (this->hist_count_ > 0 && fix_recent) {
+    // Label by counting whole seconds since the last accepted pulse
+    double rate = this->model_.valid ? this->model_.local_us_per_s : 1e6;
+    int64_t elapsed = local_us - this->last_accepted_local_us_;
+    int64_t seconds = llround(elapsed / rate);
+    if (seconds < 1)
+      return;  // glitch just after a pulse: leave the recorded pulse alone so its RMC still finds it
+    if (seconds > MAX_PULSE_GAP_S) {
+      this->reset_discipline_("PPS gap too long");
+    } else {
+      double error = static_cast<double>(elapsed) - seconds * rate;
+      double tolerance = 300.0 + 100e-6 * static_cast<double>(elapsed);
+      if (std::fabs(error) <= tolerance) {
+        this->off_second_edges_ = 0;
+        this->last_pulse_us_ = local_us;
+        this->last_pulse_utc_s_ = this->last_accepted_utc_s_ + seconds;
+        this->last_pulse_labelled_ = true;
+        this->accept_pulse_(local_us, this->last_pulse_utc_s_);
+        return;
+      }
+      // One stray edge is noise; a run of them means the pulse train itself has moved
+      if (++this->off_second_edges_ < MAX_OFF_SECOND_EDGES) {
+        ESP_LOGD(TAG, "Ignoring PPS edge %.0f us off the second", error);
+        return;
+      }
+      this->reset_discipline_("PPS no longer on the second");
+    }
   }
-  double error = static_cast<double>(elapsed) - seconds * rate;
-  double tolerance = 300.0 + 100e-6 * static_cast<double>(elapsed);
-  if (std::fabs(error) > tolerance) {
-    ESP_LOGV(TAG, "Ignoring PPS edge %.0f µs off the second", error);
-    return;
-  }
 
-  this->last_pulse_labelled_ = true;
-  this->accept_pulse_(local_us, this->last_accepted_utc_s_ + seconds);
+  // Candidate: the next valid RMC labels it
+  this->last_pulse_us_ = local_us;
+  this->last_pulse_labelled_ = false;
 }
 
 void PPSNTPServer::accept_pulse_(int64_t local_us, int64_t utc_s) {
@@ -334,6 +402,7 @@ void PPSNTPServer::accept_pulse_(int64_t local_us, int64_t utc_s) {
   if (this->model_.valid) {
     double predicted = this->model_.anchor_local_us + (utc_s - this->model_.anchor_utc_s) * this->model_.local_us_per_s;
     double residual = static_cast<double>(local_us) - predicted;
+    this->last_residual_us_ = residual;
     if (std::fabs(residual) > this->max_residual_us_) {
       if (++this->outliers_ < 3) {
         ESP_LOGW(TAG, "PPS pulse %.0f µs from prediction; ignoring", residual);
@@ -354,6 +423,7 @@ void PPSNTPServer::accept_pulse_(int64_t local_us, int64_t utc_s) {
     this->hist_count_++;
   this->last_accepted_local_us_ = local_us;
   this->last_accepted_utc_s_ = utc_s;
+  this->pulses_accepted_++;
 
   // Least-squares fit of local time against UTC seconds, relative to the newest pulse
   double rate = 1e6;
@@ -382,7 +452,9 @@ void PPSNTPServer::accept_pulse_(int64_t local_us, int64_t utc_s) {
   }
 
   ClockModel next;
-  next.valid = this->hist_count_ >= MIN_PULSES_FOR_SYNC;
+  // The first label comes from a single RMC, which a stalled loop can pair with the wrong pulse (off by a
+  // whole second). Don't serve until later RMCs have independently agreed with the pulse count.
+  next.valid = this->hist_count_ >= MIN_PULSES_FOR_SYNC && this->label_confirmations_ >= MIN_LABEL_CONFIRMATIONS;
   next.anchor_local_us = local_us + llround(fitted_offset);
   next.anchor_utc_s = utc_s;
   next.local_us_per_s = rate;
@@ -399,6 +471,8 @@ void PPSNTPServer::reset_discipline_(const char *reason) {
   this->hist_head_ = 0;
   this->outliers_ = 0;
   this->label_mismatches_ = 0;
+  this->label_confirmations_ = 0;
+  this->off_second_edges_ = 0;
   this->jitter_sq_us_ = 0;
   portENTER_CRITICAL(&this->lock_);
   this->model_.valid = false;
@@ -472,7 +546,7 @@ void PPSNTPServer::feed_byte_(uint8_t byte) {
       this->ubx_[this->ubx_len_++] = byte;
       if (this->ubx_len_ == this->ubx_expected_) {
         uint8_t ck_a = 0, ck_b = 0;
-        for (uint16_t i = 0; i < this->ubx_len_ - 2; i++) {
+        for (uint32_t i = 0; i < this->ubx_len_ - 2; i++) {
           ck_a += this->ubx_[i];
           ck_b += ck_a;
         }
@@ -486,14 +560,15 @@ void PPSNTPServer::feed_byte_(uint8_t byte) {
 
 void PPSNTPServer::handle_nmea_(char *line) {
   char *star = strchr(line, '*');
-  if (star == nullptr || strlen(star) < 3)
-    return;
   uint8_t checksum = 0;
-  for (char *p = line + 1; p < star; p++)
+  for (char *p = line + 1; star != nullptr && p < star; p++)
     checksum ^= static_cast<uint8_t>(*p);
-  if (checksum != static_cast<uint8_t>(strtoul(star + 1, nullptr, 16)))
+  if (star == nullptr || strlen(star) < 3 || checksum != static_cast<uint8_t>(strtoul(star + 1, nullptr, 16))) {
+    this->nmea_bad_++;
     return;
+  }
   *star = '\0';
+  this->nmea_ok_++;
   this->nmea_ok_since_switch_ = true;
 
   char *fields[20];
@@ -506,6 +581,8 @@ void PPSNTPServer::handle_nmea_(char *line) {
   }
 
   // Address is $ttSSS; the talker (GP, GN, GL...) is ignored
+  if (strlen(fields[0]) != 6)
+    return;
   const char *type = fields[0] + 3;
   if (strcmp(type, "RMC") == 0) {
     this->handle_rmc_(fields, count);
@@ -531,8 +608,27 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
     }
   }
 
-  int64_t utc_s = days_from_civil(2000 + two_digits(date + 4), two_digits(date + 2), two_digits(date)) * 86400 +
-                  two_digits(time) * 3600 + two_digits(time + 2) * 60 + two_digits(time + 4);
+  int day = two_digits(date), month = two_digits(date + 2), year = 2000 + two_digits(date + 4);
+  int hour = two_digits(time), minute = two_digits(time + 2), second = two_digits(time + 4);
+  if (day < 1 || day > 31 || month < 1 || month > 12 || hour > 23 || minute > 59 || second > 60)
+    return;
+  int64_t utc_s = days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
+
+  // Old and clone receivers that mishandle the 10-bit GPS week number report a date exactly a multiple of
+  // 1024 weeks in the past. Anything before this firmware existed can't be a live fix: move it forward by
+  // whole rollovers, and drop it if that still isn't plausible.
+  if (utc_s < MIN_VALID_UTC_S) {
+    int64_t reported = utc_s;
+    for (int i = 0; i < 3 && utc_s < MIN_VALID_UTC_S; i++)
+      utc_s += GPS_WEEK_ROLLOVER_S;
+    if (utc_s < MIN_VALID_UTC_S)
+      return;
+    if (!this->rollover_warned_) {
+      this->rollover_warned_ = true;
+      ESP_LOGW(TAG, "Receiver date is in the past (unix %lld); assuming GPS week rollover and using %lld",
+               static_cast<long long>(reported), static_cast<long long>(utc_s));
+    }
+  }
   this->last_rmc_valid_us_ = now_us;
 
   // A u-blox receiver sends the RMC for an epoch shortly after that epoch's pulse
@@ -541,8 +637,12 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
     return;
 
   if (this->last_pulse_labelled_) {
-    if (this->last_accepted_utc_s_ == utc_s) {
+    // Compare against the label the pulse was given, not the last accepted one: an outlier pulse is
+    // labelled correctly but never accepted
+    if (this->last_pulse_utc_s_ == utc_s) {
       this->label_mismatches_ = 0;
+      if (this->label_confirmations_ < UINT8_MAX)
+        this->label_confirmations_++;
       return;
     }
     if (++this->label_mismatches_ < 3)
@@ -550,12 +650,16 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
     this->reset_discipline_("NMEA time disagrees with PPS count");
   }
 
+  ESP_LOGD(TAG, "Labelling the pulse from %lld ms ago as unix %lld (from RMC)", static_cast<long long>(age / 1000),
+           static_cast<long long>(utc_s));
   this->last_pulse_labelled_ = true;
+  this->last_pulse_utc_s_ = utc_s;
   this->accept_pulse_(this->last_pulse_us_, utc_s);
 }
 
 void PPSNTPServer::handle_ubx_(uint8_t msg_class, uint8_t msg_id, const uint8_t *payload, uint16_t len) {
   this->ubx_seen_ = true;
+  this->ubx_frames_++;
   if (msg_class != 0x01 || msg_id != 0x21 || len < 20)
     return;
   bool valid_utc = (payload[19] & 0x04) != 0;  // NAV-TIMEUTC valid.validUTC: leap seconds are known
@@ -614,6 +718,14 @@ void PPSNTPServer::start_baud_switch_() {
 void PPSNTPServer::service_baud_switch_() {
   uint32_t now_ms = millis();
   switch (this->baud_state_) {
+    case BaudState::PROBE:
+      if (this->nmea_ok_since_switch_) {
+        ESP_LOGI(TAG, "GNSS receiver already at %u baud", static_cast<unsigned>(this->gnss_baud_rate_));
+        this->baud_state_ = BaudState::DONE;  // nothing changed, so nothing to save
+      } else if (static_cast<int32_t>(now_ms - this->baud_deadline_ms_) >= 0) {
+        this->start_baud_switch_();
+      }
+      break;
     case BaudState::VERIFY:
       if (this->nmea_ok_since_switch_) {
         // Persist to BBR/flash/EEPROM where the module has them, so a power cycle keeps the new baud
@@ -648,7 +760,99 @@ void PPSNTPServer::service_baud_switch_() {
 }
 
 // ---------------------------------------------------------------------------
-// NTP server task: timestamps as close to the socket as ESPHome allows
+// NTP server
+
+bool PPSNTPServer::build_reply_(const uint8_t *request, int64_t rx_local_us, uint8_t *reply) {
+  uint8_t version = (request[0] >> 3) & 0x07;
+  uint8_t mode = request[0] & 0x07;
+  if (mode != 3 || version < 1 || version > 4)
+    return false;
+
+  ClockModel model = this->get_model_();
+  if (!model.valid)
+    return false;  // never synchronised: stay silent rather than hand out a bogus time
+  bool synced = this->is_synced_(model, rx_local_us);
+  double age_s = static_cast<double>(rx_local_us - model.last_pulse_local_us) / 1e6;
+  double dispersion_us = DISPERSION_BASE_US + HOLDOVER_DRIFT_PPM * age_s;
+
+  memset(reply, 0, 48);
+  reply[0] = ((synced ? 0 : 3) << 6) | (version << 3) | 4;  // LI, VN, mode = server
+  reply[1] = synced ? 1 : 16;
+  reply[2] = request[2];  // poll
+  // Precision: hardware capture ~1 us (2^-20 s); the GPIO interrupt adds a few us of latency jitter (2^-18)
+  reply[3] = static_cast<uint8_t>(this->hw_capture_ ? -20 : -18);
+  put_be32(reply + 8, static_cast<uint32_t>(std::min(dispersion_us * 65536.0 / 1e6, 4294967295.0)));
+  memcpy(reply + 12, this->refid_, 4);
+  put_ntp_timestamp(reply + 16, model.anchor_utc_s * 1000000LL);
+  memcpy(reply + 24, request + 40, 8);  // originate = client's transmit
+  put_ntp_timestamp(reply + 32, utc_us_at(model, rx_local_us));
+  put_ntp_timestamp(reply + 40, utc_us_at(model, esp_timer_get_time()));  // last: as close to the send as we get
+  this->requests_++;
+  return true;
+}
+
+bool PPSNTPServer::start_server_() {
+#ifdef USE_PPS_NTP_RAW_UDP
+  return this->start_raw_udp_();
+#else
+  // Run on the core the ESPHome loop isn't on, so request timestamps don't wait out its critical sections
+#if defined(USE_PPS_NTP_TASK_CORE)
+  BaseType_t core = USE_PPS_NTP_TASK_CORE;
+#elif CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+  BaseType_t core = xPortGetCoreID() == 0 ? 1 : 0;
+#else
+  BaseType_t core = tskNO_AFFINITY;
+#endif
+  if (xTaskCreatePinnedToCore(PPSNTPServer::ntp_task, "pps_ntp", 4096, this, 10, &this->task_, core) != pdPASS) {
+    ESP_LOGE(TAG, "Could not start NTP server task");
+    return false;
+  }
+  ESP_LOGI(TAG, "Network up; serving NTP on UDP port %u (core %d)", this->port_, static_cast<int>(core));
+  return true;
+#endif
+}
+
+#ifdef USE_PPS_NTP_RAW_UDP
+// EXPERIMENTAL, not yet run on hardware. Serves straight from lwIP's tcpip thread: the request is
+// timestamped in the UDP input callback and answered there, with no socket mailbox, no task wake-up
+// and no second copy. Select with `transport: raw_lwip`.
+bool PPSNTPServer::start_raw_udp_() {
+  LwIPLock lock;
+  this->pcb_ = udp_new_ip_type(IPADDR_TYPE_ANY);
+  if (this->pcb_ == nullptr) {
+    ESP_LOGE(TAG, "Could not allocate a UDP PCB");
+    return false;
+  }
+  err_t err = udp_bind(this->pcb_, IP_ANY_TYPE, this->port_);
+  if (err != ERR_OK) {
+    ESP_LOGE(TAG, "Could not bind UDP port %u (lwIP error %d)", this->port_, static_cast<int>(err));
+    udp_remove(this->pcb_);
+    this->pcb_ = nullptr;
+    return false;
+  }
+  udp_recv(this->pcb_, PPSNTPServer::raw_recv, this);
+  ESP_LOGI(TAG, "Network up; serving NTP on UDP port %u (raw lwIP)", this->port_);
+  return true;
+}
+
+// Runs in the tcpip thread: keep it short, never block, never log
+void PPSNTPServer::raw_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, uint16_t port) {
+  int64_t rx_local = esp_timer_get_time();
+  auto *self = static_cast<PPSNTPServer *>(arg);
+  uint8_t request[48];
+  if (p != nullptr && p->tot_len >= sizeof(request) &&
+      pbuf_copy_partial(p, request, sizeof(request), 0) == sizeof(request)) {
+    struct pbuf *out = pbuf_alloc(PBUF_TRANSPORT, 48, PBUF_RAM);
+    if (out != nullptr) {
+      if (self->build_reply_(request, rx_local, static_cast<uint8_t *>(out->payload)))
+        udp_sendto(pcb, out, addr, port);
+      pbuf_free(out);
+    }
+  }
+  if (p != nullptr)
+    pbuf_free(p);
+}
+#endif  // USE_PPS_NTP_RAW_UDP
 
 void PPSNTPServer::ntp_task(void *arg) { static_cast<PPSNTPServer *>(arg)->ntp_loop_(); }
 
@@ -680,32 +884,9 @@ void PPSNTPServer::ntp_loop_() {
         break;
       if (received < 48)
         continue;
-      uint8_t version = (request[0] >> 3) & 0x07;
-      uint8_t mode = request[0] & 0x07;
-      if (mode != 3 || version < 1 || version > 4)
-        continue;
-
-      ClockModel model = this->get_model_();
-      if (!model.valid)
-        continue;  // never synchronised: stay silent rather than hand out a bogus time
-      bool synced = this->is_synced_(model, rx_local);
-      double age_s = static_cast<double>(rx_local - model.last_pulse_local_us) / 1e6;
-      double dispersion_us = DISPERSION_BASE_US + HOLDOVER_DRIFT_PPM * age_s;
-
-      uint8_t reply[48] = {0};
-      reply[0] = ((synced ? 0 : 3) << 6) | (version << 3) | 4;  // LI, VN, mode = server
-      reply[1] = synced ? 1 : 16;
-      reply[2] = request[2];                       // poll
-      // Precision: hardware capture ~1 µs (2^-20 s); the GPIO interrupt adds a few µs of latency jitter (2^-18)
-      reply[3] = static_cast<uint8_t>(this->hw_capture_ ? -20 : -18);
-      put_be32(reply + 8, static_cast<uint32_t>(std::min(dispersion_us * 65536.0 / 1e6, 4294967295.0)));
-      memcpy(reply + 12, this->refid_, 4);
-      put_ntp_timestamp(reply + 16, model.anchor_utc_s * 1000000LL);
-      memcpy(reply + 24, request + 40, 8);  // originate = client's transmit
-      put_ntp_timestamp(reply + 32, utc_us_at(model, rx_local));
-      put_ntp_timestamp(reply + 40, utc_us_at(model, esp_timer_get_time()));
-      sendto(sock, reply, sizeof(reply), 0, reinterpret_cast<struct sockaddr *>(&source), source_len);
-      this->requests_++;
+      uint8_t reply[48];
+      if (this->build_reply_(request, rx_local, reply))
+        sendto(sock, reply, sizeof(reply), 0, reinterpret_cast<struct sockaddr *>(&source), source_len);
     }
     close(sock);
   }

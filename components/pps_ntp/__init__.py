@@ -38,6 +38,10 @@ CONF_FIT_WINDOW = "fit_window"
 CONF_MAX_RESIDUAL = "max_residual"
 CONF_REFID = "refid"
 CONF_TASK_CORE = "task_core"
+CONF_REQUIRE_UTC_VALID = "require_utc_valid"
+CONF_TRANSPORT = "transport"
+TRANSPORT_SOCKET = "socket"
+TRANSPORT_RAW_LWIP = "raw_lwip"
 
 UNIT_MICROSECOND = "µs"
 
@@ -86,6 +90,13 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_REFID, default="GPS"): validate_refid,
             # Pin the NTP task to a core; by default it goes on the core the ESPHome loop isn't using
             cv.Optional(CONF_TASK_CORE): cv.int_range(min=0, max=1),
+            # Never serve until the receiver confirms UTC over UBX. Without this, a receiver that doesn't
+            # answer UBX is trusted after 60 s, which can be a leap-second count off for ~12.5 min from cold
+            cv.Optional(CONF_REQUIRE_UTC_VALID, default=False): cv.boolean,
+            # EXPERIMENTAL raw_lwip: answer from lwIP's tcpip thread instead of a socket task
+            cv.Optional(CONF_TRANSPORT, default=TRANSPORT_SOCKET): cv.one_of(
+                TRANSPORT_SOCKET, TRANSPORT_RAW_LWIP, lower=True
+            ),
             # Raise an older u-blox module (NEO-6M/7M/M8, GT-U7) to this baud using legacy UBX-CFG-PRT
             cv.Optional(CONF_GNSS_BAUD_RATE): cv.one_of(
                 9600, 19200, 38400, 57600, 115200, 230400, int=True
@@ -135,6 +146,11 @@ CONFIG_SCHEMA = cv.All(
 def _final_validate_task_core(config):
     if CONF_TASK_CORE not in config:
         return config
+    if config[CONF_TRANSPORT] == TRANSPORT_RAW_LWIP:
+        raise cv.Invalid(
+            "task_core has no effect with transport: raw_lwip (there is no NTP task)",
+            path=[CONF_TASK_CORE],
+        )
     variant = esp32.get_esp32_variant()
     if variant not in DUAL_CORE_VARIANTS:
         raise cv.Invalid(
@@ -176,6 +192,9 @@ async def to_code(config):
     cg.add(var.set_fit_window(config[CONF_FIT_WINDOW]))
     cg.add(var.set_max_residual_us(config[CONF_MAX_RESIDUAL].total_microseconds))
     cg.add(var.set_refid(config[CONF_REFID]))
+    cg.add(var.set_require_utc_valid(config[CONF_REQUIRE_UTC_VALID]))
+    if config[CONF_TRANSPORT] == TRANSPORT_RAW_LWIP:
+        cg.add_define("USE_PPS_NTP_RAW_UDP")
     if CONF_TASK_CORE in config:
         # Also checked at compile time against the build's FreeRTOS core count
         cg.add_define("USE_PPS_NTP_TASK_CORE", config[CONF_TASK_CORE])

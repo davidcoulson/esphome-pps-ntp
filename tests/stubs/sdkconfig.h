@@ -1,0 +1,2 @@
+#pragma once
+#define CONFIG_FREERTOS_NUMBER_OF_CORES 2

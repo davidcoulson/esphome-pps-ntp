@@ -19,6 +19,12 @@
 #include <driver/mcpwm_cap.h>
 #endif
 
+#ifdef USE_PPS_NTP_RAW_UDP
+struct udp_pcb;
+struct pbuf;
+#include <lwip/ip_addr.h>
+#endif
+
 namespace esphome::pps_ntp {
 
 // Maps the local esp_timer clock (µs since boot) onto UTC, re-fitted on every accepted PPS pulse
@@ -45,6 +51,7 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void set_fit_window(int pulses) { this->fit_window_ = pulses; }
   void set_max_residual_us(double us) { this->max_residual_us_ = us; }
   void set_refid(const char *refid) { strncpy(this->refid_, refid, sizeof(this->refid_)); }
+  void set_require_utc_valid(bool require) { this->require_utc_valid_ = require; }
 
   void set_satellites_sensor(sensor::Sensor *s) { this->satellites_sensor_ = s; }
   void set_frequency_offset_sensor(sensor::Sensor *s) { this->frequency_offset_sensor_ = s; }
@@ -56,6 +63,15 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   static void pps_isr(PPSNTPServer *self);
   static void ntp_task(void *arg);
   void ntp_loop_();
+  bool start_server_();
+  // Fills a 48-byte reply for a 48-byte (or longer) request; false means stay silent
+  bool build_reply_(const uint8_t *request, int64_t rx_local_us, uint8_t *reply);
+#ifdef USE_PPS_NTP_RAW_UDP
+  // EXPERIMENTAL: serve from lwIP's tcpip thread, skipping the socket mailbox and task wake-up
+  bool start_raw_udp_();
+  static void raw_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, uint16_t port);
+  struct udp_pcb *pcb_{nullptr};
+#endif
 
   // PPS capture
   bool setup_capture_();
@@ -75,6 +91,7 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void handle_pulse_(int64_t local_us);
   void accept_pulse_(int64_t local_us, int64_t utc_s);
   void reset_discipline_(const char *reason);
+  void log_status_();
   void publish_model_();
   ClockModel get_model_();
   bool is_synced_(const ClockModel &model, int64_t now_local_us) const;
@@ -99,11 +116,15 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   double cap_ticks_per_us_{80.0};
   uint32_t last_cap_value_{0};
   int cap_group_{-1};
+  portMUX_TYPE ref_lock_ = portMUX_INITIALIZER_UNLOCKED;
 #endif
 
   // Pulses and labels
-  int64_t last_pulse_us_{0};  // most recent raw pulse, labelled or not
+  int64_t last_pulse_us_{0};     // most recent plausible pulse: accepted, or a candidate waiting for its RMC
+  int64_t last_pulse_utc_s_{0};  // the label given to that pulse
   bool last_pulse_labelled_{false};
+  uint8_t off_second_edges_{0};     // consecutive edges that weren't a whole number of seconds after the last pulse
+  uint8_t label_confirmations_{0};  // RMC sentences that agreed with the pulse count since the last reset
   int64_t last_rmc_valid_us_{0};  // local time of the last RMC with an 'A' fix
   uint8_t label_mismatches_{0};
   uint8_t outliers_{0};
@@ -118,12 +139,26 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   int64_t last_accepted_local_us_{0};
   int64_t last_accepted_utc_s_{0};
   double jitter_sq_us_{0};
+  double last_residual_us_{0};
+
+  // Diagnostics, reported by update()
+  uint32_t edges_seen_{0};
+  uint32_t pulses_accepted_{0};
+  uint32_t nmea_ok_{0};
+  uint32_t nmea_bad_{0};
+  uint32_t ubx_frames_{0};
+  uint32_t status_edges_{0};  // edges_seen_ / nmea_ok_ at the previous update(), to spot a dead input
+  uint32_t status_nmea_{0};
+  bool rollover_warned_{false};
 
   // Model shared with the NTP task
   portMUX_TYPE lock_ = portMUX_INITIALIZER_UNLOCKED;
   ClockModel model_;
   bool utc_trusted_{false};
   bool ubx_seen_{false};
+  bool require_utc_valid_{false};
+  bool ubx_absent_warned_{false};
+  bool server_started_{false};
   uint32_t boot_ms_{0};
   uint32_t last_ubx_poll_ms_{0};
   bool last_synced_{false};
@@ -136,12 +171,12 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   char nmea_[96];
   uint8_t nmea_len_{0};
   uint8_t ubx_[4 + 256 + 2];
-  uint16_t ubx_len_{0};
-  uint16_t ubx_expected_{0};
+  uint32_t ubx_len_{0};
+  uint32_t ubx_expected_{0};  // 32-bit: 4 + a 16-bit length + 2 doesn't fit in 16
   int satellites_{-1};
 
   // Baud switching for legacy u-blox modules
-  enum class BaudState : uint8_t { OFF, VERIFY, RETRY_WAIT, DONE };
+  enum class BaudState : uint8_t { OFF, PROBE, VERIFY, RETRY_WAIT, DONE };
   BaudState baud_state_{BaudState::OFF};
   uint32_t original_baud_{0};
   uint32_t baud_deadline_ms_{0};

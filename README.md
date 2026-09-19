@@ -20,6 +20,9 @@ GNSS UART ─► NMEA RMC (which second) ┤
 
 1. **PPS capture.** On chips with an MCPWM unit (ESP32, S3, C5, C6, H2, P4), the capture hardware latches an 80 MHz timer at the moment the PPS edge arrives. No interrupt is involved, so interrupt latency and flash-write stalls (NVS, OTA) can't delay the timestamp. The ESPHome loop reads the latch, then software-latches the same timer between two `esp_timer` reads to map the edge onto the system timeline. Chips without MCPWM, or `hardware_capture: false`, fall back to an IRAM GPIO interrupt.
 2. **Labelling.** The RMC sentence that follows each pulse says which UTC second it marked. After that, pulses are counted, and RMC is used to cross-check.
+   - The server doesn't answer until 3 later RMCs have independently agreed with the count. That guards against a first label that is off by a whole second.
+   - Stray edges (noise on the PPS line) are ignored. Three misaligned edges in a row, or three RMC disagreements, reset the fit.
+   - Dates before 2026 are treated as a GPS week-number rollover (old and clone receivers) and moved forward by whole multiples of 1024 weeks.
 3. **Discipline.** A least-squares fit over the last 64 pulses gives the crystal's rate and phase. The ESP32 system clock is left alone; NTP timestamps are computed straight from the fit.
 4. **Leap-second safety.** The receiver is polled with `UBX-NAV-TIMEUTC`, and the server reports itself as unsynchronised until the receiver confirms UTC is valid. (After a cold start, u-blox receivers can report time with the wrong leap-second count for up to about 12.5 minutes.) Receivers that don't answer UBX fall back to NMEA-only after 60 s.
 5. **Serving.** A dedicated FreeRTOS task, pinned to the core the ESPHome loop isn't using, answers NTPv3 and NTPv4 client requests. It timestamps each request as soon as it arrives and each reply just before sending.
@@ -52,7 +55,7 @@ Wiring (example config):
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.2.1
+  - source: github://davidcoulson/esphome-pps-ntp@v0.2.2
     components: [pps_ntp]
 
 uart:
@@ -86,14 +89,16 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 | Key | Default | Description |
 |---|---|---|
 | `uart_id` | — | UART connected to the receiver. Needs both RX and TX, because the component sends UBX commands. |
-| `pps_pin` | **required** | GPIO connected to the receiver's PPS output. |
+| `pps_pin` | **required** | GPIO connected to the receiver's PPS output. The pin's `mode` (pull-up or pull-down) and `inverted: true` (active-low PPS) apply in both capture modes. |
 | `port` | `123` | UDP port to listen on. |
 | `hardware_capture` | `true` | Timestamp PPS with the MCPWM capture unit where the chip has one. Set to `false` to force the GPIO interrupt. |
-| `gnss_baud_rate` | none | If set, sends the legacy `UBX-CFG-PRT` command at boot to move the receiver to this baud rate. It verifies the switch, saves it with `UBX-CFG-CFG`, and falls back to the original rate if the switch fails. Useful for NEO-6M/7M/M8 modules stuck at 9600. |
+| `gnss_baud_rate` | none | If set, the component first listens at this rate for 1.5 s (the receiver keeps its setting across ESP reboots). Only if that stays quiet does it send the legacy `UBX-CFG-PRT` command at the UART's configured rate, verify the switch, save it with `UBX-CFG-CFG`, and fall back to the original rate if the switch fails. Useful for NEO-6M/7M/M8 modules stuck at 9600. |
 | `holdover` | `15min` | How long to keep serving stratum 1 after PPS or the fix is lost. |
 | `fit_window` | `64` | Pulses in the least-squares fit (8–256). Longer windows average out more noise; shorter ones track temperature changes in the crystal faster. |
 | `max_residual` | `1000us` | A pulse further than this from the model is an outlier; three in a row reset the fit. With hardware capture, about `50us` is a reasonable tighter setting once the node has proven stable. |
 | `refid` | `GPS` | NTP reference ID sent to clients (1–4 ASCII characters, e.g. `PPS`). |
+| `require_utc_valid` | `false` | If `true`, never claim stratum 1 until the receiver confirms UTC over UBX. By default a receiver that doesn't answer UBX is trusted after 60 s, which can be one leap-second count off for up to about 12.5 minutes after a cold start. |
+| `transport` | `socket` | `raw_lwip` is **experimental and not yet run on hardware**. It answers from lwIP's tcpip thread instead of a socket task, which removes the socket mailbox and a task wake-up from the timestamp path. `task_core` can't be combined with it. |
 | `task_core` | auto | Pins the NTP task to core `0` or `1`. By default it runs on the core the ESPHome loop isn't using. Rejected at validation on single-core chips (C2/C3/C5/C6/C61/H2/S2) and on an ESP32 built with `CONFIG_FREERTOS_UNICORE`. A compile-time `#error` catches anything else that ends up single-core. |
 | `update_interval` | `60s` | How often the sensors publish. |
 
@@ -106,6 +111,25 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 | `pps_jitter` | sensor (µs) | RMS scatter of the pulses around the fitted model. |
 | `requests` | sensor | NTP requests served since boot. |
 | `synced` | binary sensor | On while serving stratum 1. |
+
+## Diagnostics
+
+Every `update_interval` the component logs a status line at DEBUG:
+
+```
+edges=61 accepted=60 nmea=122/0 bad ubx=9 utc_valid=YES fit=60/64 confirmed=57 residual=-0.8us jitter=1.2us sats=9 stack_free=2140
+```
+
+- `edges` / `accepted`: PPS edges seen, and pulses that went into the fit.
+- `nmea=ok/bad`: sentences with a good and a bad checksum. `ubx`: UBX frames received.
+- `confirmed`: RMC sentences that agreed with the pulse count since the last reset (3 are needed to serve).
+- `stack_free`: the NTP task's stack high-water mark, in bytes.
+
+At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports when no PPS edges or no valid NMEA arrived during the interval. Those are the two symptoms of a wiring fault, and nothing else would log them.
+
+## Tests
+
+`tests/run.sh` builds the component against stub headers on the host and runs it against a scripted receiver: a normal start with a baud switch, a receiver already at the target baud, glitch edges, a stalled loop with a lost sentence at the first label, a GPS week rollover, an oversized UBX frame, a receiver without UBX (with and without `require_utc_valid`), a cold start with UTC not yet valid, loss of fix, a 20-minute outage, and a 5 ms PPS phase step. Each scenario checks the time the server would hand out against the simulated truth. It exercises the logic only; it says nothing about real capture jitter or network delay.
 
 ## Verifying
 
