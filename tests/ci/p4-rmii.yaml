@@ -1,0 +1,35 @@
+# ESP32-P4 (Waveshare ESP32-P4-ETH, pre-v3 silicon): RMII Ethernet, MCPWM capture
+esphome:
+  name: ci-p4
+esp32:
+  board: esp32-p4-evboard
+  variant: esp32p4
+  engineering_sample: true
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+external_components:
+  - source:
+      type: local
+      path: ../../components
+logger:
+  hardware_uart: UART0
+api:
+ethernet:
+  type: IP101
+  mdc_pin: GPIO31
+  mdio_pin: GPIO52
+  power_pin: GPIO51
+  clk:
+    mode: CLK_EXT_IN
+    pin: GPIO50
+  phy_addr: 1
+uart:
+  id: gnss_uart
+  rx_pin: GPIO21
+  tx_pin: GPIO22
+  baud_rate: 9600
+pps_ntp:
+  uart_id: gnss_uart
+  pps_pin: GPIO20
+  synced: {name: GPS Synced}

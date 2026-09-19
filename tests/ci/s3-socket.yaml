@@ -1,0 +1,45 @@
+# ESP32-S3 + W5500: MCPWM capture, socket transport, every option set
+esphome:
+  name: ci-s3-socket
+esp32:
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+external_components:
+  - source:
+      type: local
+      path: ../../components
+logger:
+api:
+ethernet:
+  type: W5500
+  clk_pin: GPIO13
+  mosi_pin: GPIO11
+  miso_pin: GPIO12
+  cs_pin: GPIO14
+  interrupt_pin: GPIO10
+  reset_pin: GPIO9
+uart:
+  id: gnss_uart
+  rx_pin: GPIO17
+  tx_pin: GPIO16
+  baud_rate: 9600
+  rx_buffer_size: 1024
+pps_ntp:
+  uart_id: gnss_uart
+  pps_pin:
+    number: GPIO15
+    mode: {input: true, pulldown: true}
+  gnss_baud_rate: 115200
+  holdover: 15min
+  fit_window: 32
+  max_residual: 50us
+  refid: PPS
+  task_core: 1
+  require_utc_valid: true
+  satellites: {name: Satellites}
+  frequency_offset: {name: Crystal Offset}
+  pps_jitter: {name: PPS Jitter}
+  requests: {name: NTP Requests}
+  synced: {name: GPS Synced}

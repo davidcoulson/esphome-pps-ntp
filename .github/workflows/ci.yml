@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"   # weekly, to catch ESPHome releases that break the build
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-sim:
+    name: Host simulation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the scripted-receiver scenarios
+        run: tests/run.sh
+
+  validate:
+    name: Config validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install esphome
+      - name: Valid configs validate
+        run: |
+          for f in tests/ci/[!i]*.yaml; do
+            echo "::group::$f"; esphome config "$f" > /dev/null; echo "::endgroup::"
+          done
+      - name: task_core on a single-core chip is rejected
+        run: |
+          if esphome config tests/ci/invalid-task-core-c3.yaml > out.txt 2>&1; then
+            echo "expected a validation error"; exit 1
+          fi
+          grep -q "task_core needs a dual-core chip" out.txt
+
+  compile:
+    name: Compile ${{ matrix.config }}
+    runs-on: ubuntu-latest
+    needs: [host-sim, validate]
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [s3-socket, s3-idf61, s3-raw-ipv6-sim, c3-gpio-isr, p4-rmii]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install esphome
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.espressif
+            ~/.cache/esphome
+          key: toolchains-${{ matrix.config }}-${{ hashFiles('tests/ci/*.yaml') }}
+          restore-keys: toolchains-${{ matrix.config }}-
+      - name: Compile
+        run: esphome compile tests/ci/${{ matrix.config }}.yaml 2>&1 | tee build.log
+      - name: No warnings from this repo's components
+        run: |
+          if grep -E "components/(pps_ntp|gnss_sim)/.*warning:" build.log; then
+            echo "new compiler warnings"; exit 1
+          fi
