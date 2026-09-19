@@ -18,6 +18,8 @@ namespace esphome::gnss_sim {
 static const char *const TAG = "gnss_sim";
 static constexpr int64_t MIN_VALID_TIME_S = 1767225600;  // 2026-01-01: the system clock has been set
 static constexpr int64_t GPS_WEEK_ROLLOVER_S = 619315200;
+static constexpr int64_t FAKE_EPOCH_S = 1789819200;  // 2026-09-19 12:00:00 UTC
+static constexpr int64_t CLOCK_WAIT_US = 20000000;   // how long to wait for a real time source
 static constexpr int64_t LEAP_DAY_235959_S = 1798761599;  // 2026-12-31 23:59:59 UTC
 
 void GNSSSim::setup() {
@@ -66,9 +68,15 @@ void GNSSSim::start_() {
   // the system clock instead would turn every SNTP/HA time adjustment into a PPS phase step.
   struct timeval tv;
   gettimeofday(&tv, nullptr);
-  if (tv.tv_sec < MIN_VALID_TIME_S)
-    return;
-  this->first_epoch_s_ = tv.tv_sec + 2;
+  if (tv.tv_sec < MIN_VALID_TIME_S) {
+    // No time source (for example a node Home Assistant hasn't adopted yet). Give it a few seconds,
+    // then run on a fixed fake date: the logic under test doesn't care what the date is.
+    if (esp_timer_get_time() < CLOCK_WAIT_US)
+      return;
+    ESP_LOGW(TAG, "System clock is not set; reporting a fake date starting 2026-09-19 12:00:00 UTC");
+    this->fake_clock_offset_s_ = FAKE_EPOCH_S - tv.tv_sec;
+  }
+  this->first_epoch_s_ = tv.tv_sec + this->fake_clock_offset_s_ + 2;
 
   esp_timer_create_args_t args = {};
   args.callback = &GNSSSim::pulse_cb;
@@ -82,7 +90,7 @@ void GNSSSim::start_() {
   // First pulse on the next-but-one second boundary of the system clock. Every later deadline is the
   // previous one plus the period, so timer latency never accumulates.
   gettimeofday(&tv, nullptr);
-  int64_t to_first = (this->first_epoch_s_ - tv.tv_sec) * 1000000LL - tv.tv_usec;
+  int64_t to_first = (this->first_epoch_s_ - (tv.tv_sec + this->fake_clock_offset_s_)) * 1000000LL - tv.tv_usec;
   if (to_first < 1000)
     to_first = 1000;
   this->deadline_us_ = esp_timer_get_time() + to_first;

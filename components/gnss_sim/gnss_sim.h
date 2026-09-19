@@ -73,6 +73,7 @@ class GNSSSim : public Component {
   bool started_{false};
   esp_timer_handle_t timer_{nullptr};
   int64_t first_epoch_s_{0};
+  int64_t fake_clock_offset_s_{0};
 
   // Written by the timer callback
   std::atomic<uint32_t> pulse_count_{0};

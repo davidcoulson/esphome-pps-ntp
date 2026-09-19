@@ -59,7 +59,7 @@ Wiring (example config):
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.3.0
+  - source: github://davidcoulson/esphome-pps-ntp@v0.3.1
     components: [pps_ntp]
 
 uart:
@@ -144,7 +144,7 @@ At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports wh
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.3.0
+  - source: github://davidcoulson/esphome-pps-ntp@v0.3.1
     components: [pps_ntp, gnss_sim]
 
 gnss_sim:
