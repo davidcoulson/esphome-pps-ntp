@@ -2,7 +2,7 @@
 
 An [ESPHome](https://esphome.io) external component that turns an ESP32 with Ethernet and a GNSS receiver into a **stratum-1 NTP server** disciplined by the receiver's **PPS (pulse-per-second)** output.
 
-> **Status: experimental.** Compiles against ESPHome 2026.9 (ESP-IDF). Hardware testing is in progress.
+> **Status: experimental.** Compiles against ESPHome 2026.9 on ESP-IDF 5.5 and 6.1. Hardware testing is in progress.
 
 ## How it works
 
@@ -52,7 +52,7 @@ Wiring (example config):
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp
+  - source: github://davidcoulson/esphome-pps-ntp@v0.1.0
     components: [pps_ntp]
 
 uart:

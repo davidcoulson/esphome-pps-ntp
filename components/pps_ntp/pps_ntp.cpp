@@ -150,9 +150,10 @@ void PPSNTPServer::dump_config() {
                 "  Port: %u\n"
                 "  Holdover: %us",
                 this->port_, static_cast<unsigned>(this->holdover_us_ / 1000000));
-  if (this->gnss_baud_rate_ != 0)
+  if (this->gnss_baud_rate_ != 0) {
     ESP_LOGCONFIG(TAG, "  GNSS baud rate: %u (from %u)", static_cast<unsigned>(this->gnss_baud_rate_),
                   static_cast<unsigned>(this->original_baud_));
+  }
   LOG_UPDATE_INTERVAL(this);
   LOG_SENSOR("  ", "Satellites", this->satellites_sensor_);
   LOG_SENSOR("  ", "Frequency Offset", this->frequency_offset_sensor_);
