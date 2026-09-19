@@ -55,7 +55,7 @@ Wiring (example config):
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.2.2
+  - source: github://davidcoulson/esphome-pps-ntp@v0.2.3
     components: [pps_ntp]
 
 uart:
@@ -130,6 +130,30 @@ At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports wh
 ## Tests
 
 `tests/run.sh` builds the component against stub headers on the host and runs it against a scripted receiver: a normal start with a baud switch, a receiver already at the target baud, glitch edges, a stalled loop with a lost sentence at the first label, a GPS week rollover, an oversized UBX frame, a receiver without UBX (with and without `require_utc_valid`), a cold start with UTC not yet valid, loss of fix, a 20-minute outage, and a 5 ms PPS phase step. Each scenario checks the time the server would hand out against the simulated truth. It exercises the logic only; it says nothing about real capture jitter or network delay.
+
+## Testing without a receiver: `gnss_sim`
+
+`components/gnss_sim` is a **test-only** emulator of a u-blox receiver. It produces a 1 Hz PPS pulse, the default NMEA sentence set, and the UBX messages `pps_ntp` uses (NAV-TIMEUTC polls, CFG-PRT baud changes, CFG-CFG saves).
+
+- **Two boards:** run it on a spare ESP32 and wire PPS, TX, RX and GND to the node under test. The two crystals differ, so the node's frequency-offset and jitter sensors show real numbers.
+- **One board:** give it the same pins `pps_ntp` uses (its `tx_pin` is the node's UART RX pin, and so on). The signals are looped back inside the chip through the GPIO matrix, with no wires. Both ends share one crystal, so set `ppm:` to fake a frequency difference.
+
+```yaml
+external_components:
+  - source: github://davidcoulson/esphome-pps-ntp@v0.2.3
+    components: [pps_ntp, gnss_sim]
+
+gnss_sim:
+  id: sim
+  pps_pin: 15   # plain numbers, so ESPHome allows sharing the pin with pps_ntp
+  tx_pin: 17
+  rx_pin: 16
+  ppm: 12
+```
+
+Faults can be injected from lambdas: `set_pps_enabled`, `set_nmea_enabled`, `set_fix`, `set_utc_valid`, `set_answer_ubx`, `set_week_rollover`, `inject_glitch`, `step_phase_us`, `step_time_s`.
+
+The time it reports is the node's own system clock at start-up (so the node needs a `time:` source), free-running after that. **Never point real NTP clients at a node fed by the emulator.**
 
 ## Verifying
 
