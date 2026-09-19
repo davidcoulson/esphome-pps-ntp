@@ -102,7 +102,7 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 | `max_residual` | `1000us` | A pulse further than this from the model is an outlier; three in a row reset the fit. With hardware capture, about `50us` is a reasonable tighter setting once the node has proven stable. |
 | `refid` | `GPS` | NTP reference ID sent to clients (1–4 ASCII characters, e.g. `PPS`). |
 | `require_utc_valid` | `false` | If `true`, never claim stratum 1 until the receiver confirms UTC over UBX. By default a receiver that doesn't answer UBX is trusted after 60 s, which can be one leap-second count off for up to about 12.5 minutes after a cold start. |
-| `transport` | `socket` | `raw_lwip` is **experimental and not yet run on hardware**. It answers from lwIP's tcpip thread instead of a socket task, which removes the socket mailbox and a task wake-up from the timestamp path. `task_core` can't be combined with it. |
+| `transport` | `socket` | `raw_lwip` is **experimental**: it has served a few thousand requests on an ESP32-S3-ETH without trouble, and cut the median round trip by about 0.45 ms and the tail by more (see Limitations), but it hasn't had a long soak. It answers from lwIP's tcpip thread instead of a socket task, which removes the socket mailbox and a task wake-up from the timestamp path. `task_core` can't be combined with it. |
 | `task_core` | auto | Pins the NTP task to core `0` or `1`. By default it runs on the core the ESPHome loop isn't using. Rejected at validation on single-core chips (C2/C3/C5/C6/C61/H2/S2) and on an ESP32 built with `CONFIG_FREERTOS_UNICORE`. A compile-time `#error` catches anything else that ends up single-core. |
 | `update_interval` | `60s` | How often the sensors publish. |
 
@@ -173,7 +173,15 @@ chronyc sources -v              # after adding "server <device-ip> iburst" to ch
 
 - IPv4 only.
 - Leap seconds are only announced in advance (LI bits) with a receiver that supports `UBX-NAV-TIMELS` (u-blox 8 and later).
-- NTP packet timestamps are taken in the socket task, not in hardware. On SPI Ethernet (W5500) that means roughly 50–200 µs of asymmetry, from the chip's interrupt, the SPI frame read and lwIP. This dominates the error budget: PPS capture is accurate to about 1 µs. It's far better than Wi-Fi or internet NTP, but not PTP-grade. An RMII MAC (for example ESP32-P4 or a classic ESP32 with a LAN8720) shortens this path.
+- NTP packet timestamps are taken in software, not by the Ethernet hardware, so whatever the network path inside the node costs is invisible to them. Measured on an ESP32-S3-ETH (W5500 over SPI) from a wired host one router hop away, 400 requests per run:
+
+  | | median RTT | p95 RTT |
+  |---|---|---|
+  | ICMP ping (the floor for this path) | 1.8 ms | 2.0 ms |
+  | `transport: socket` | 2.43 ms | 3.3 ms |
+  | `transport: raw_lwip` | 1.98 ms | 2.15 ms |
+
+  The router hop is about 0.35 ms of that, which leaves roughly 0.6–0.7 ms each way inside the W5500, its SPI driver and lwIP. NTP only suffers from the part of that which differs between the two directions, which these numbers can't show; assume a few hundred microseconds of possible error on SPI Ethernet. PPS capture itself is good to about a microsecond, so the network path is the whole error budget. An RMII MAC (ESP32-P4, or a classic ESP32 with a LAN8720) should be much better. `tools/ntpprobe.py` reproduces the measurement.
 - Assumes the receiver's PPS rising edge marks the start of the UTC second (the u-blox default).
 
 ## Credits
