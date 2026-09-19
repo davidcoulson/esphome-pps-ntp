@@ -39,6 +39,7 @@ pps_ntp:
   task_core: 1
   require_utc_valid: true
   satellites: {name: Satellites}
+  signal_strength: {name: Signal Strength}
   frequency_offset: {name: Crystal Offset}
   pps_jitter: {name: PPS Jitter}
   requests: {name: NTP Requests}

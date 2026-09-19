@@ -3,6 +3,9 @@
 Hardware status: run on an ESP32-S3-ETH against the `gnss_sim` emulator. Not yet run against a real receiver.
 
 ## Unreleased
+
+## v0.3.3 - 2026-09-19
+- New `signal_strength` sensor: mean C/N0 of the tracked satellites, parsed from GSV. Intended for comparing antenna positions.
 - CI: host simulation, config validation (including a config that must be rejected), and compiles for ESP32-S3 (ESP-IDF default and 6.1.0), S3 with raw lwIP + IPv6 + `gnss_sim`, ESP32-C3 and ESP32-P4.
 
 ## v0.3.2 - 2026-09-19

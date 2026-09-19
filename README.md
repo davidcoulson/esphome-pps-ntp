@@ -45,7 +45,7 @@ The ESPHome main loop only handles parsing and the fit. Nothing time-critical de
 |---|---|
 | ESP32 with **Ethernet** | Tested target: Waveshare ESP32-S3-ETH (W5500, optional PoE). Any ESPHome-supported Ethernet board should work. Wi-Fi works but adds milliseconds of jitter, so use Ethernet. |
 | GNSS receiver **with PPS** | u-blox (NEO-6M/7M/M8/M9/M10) or a u-blox clone. The PPS must be **3.3 V logic**. |
-| Active GNSS antenna | Recommended for indoor installs. Put it at a window or outdoors. |
+| Active GNSS antenna | Recommended for indoor installs. Put it at a window, in the attic, or outdoors, and watch the `signal_strength` sensor to compare spots. Its amplifier sits ahead of the cable, so extension loss costs gain rather than signal-to-noise: at 1575 MHz budget roughly 1.1 dB/m for RG174, 0.65 dB/m for RG58 and 0.4 dB/m for LMR-240, and keep 15 dB or more of gain at the module. |
 
 Wiring (example config):
 
@@ -61,7 +61,7 @@ Wiring (example config):
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.3.2
+  - source: github://davidcoulson/esphome-pps-ntp@v0.3.3
     components: [pps_ntp]
 
 uart:
@@ -113,6 +113,7 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 | Key | Type | Meaning |
 |---|---|---|
 | `satellites` | sensor | Satellites used in the fix (from GGA). |
+| `signal_strength` | sensor (dB-Hz) | Mean C/N0 across the satellites the receiver is tracking, from the GSV sentences of one epoch. Satellites in view but not tracked are excluded; 0 means nothing is being tracked at all. **This is the number to compare antenna positions with** — the satellite count saturates long before signal strength does. Roughly: below 30 is poor, 35–40 is a decent indoor install, above 42 is a clear sky view. |
 | `frequency_offset` | sensor (ppm) | Measured error of the ESP32 crystal. |
 | `pps_jitter` | sensor (µs) | RMS scatter of the pulses around the fitted model. |
 | `requests` | sensor | NTP requests served since boot. |
@@ -135,7 +136,7 @@ At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports wh
 
 ## Tests
 
-`tests/run.sh` builds the component against stub headers on the host and runs it against a scripted receiver: a normal start with a baud switch, a receiver already at the target baud, glitch edges, a stalled loop with a lost sentence at the first label, a GPS week rollover, an oversized UBX frame, a receiver without UBX (with and without `require_utc_valid`), a cold start with UTC not yet valid, loss of fix, a 20-minute outage, a 5 ms PPS phase step, and an inserted leap second both with and without advance notice. Each scenario checks the time the server would hand out against the simulated truth. It exercises the logic only; it says nothing about real capture jitter or network delay.
+`tests/run.sh` builds the component against stub headers on the host and runs it against a scripted receiver: a normal start with a baud switch, a receiver already at the target baud, glitch edges, a stalled loop with a lost sentence at the first label, a GPS week rollover, an oversized UBX frame, a receiver without UBX (with and without `require_utc_valid`), a cold start with UTC not yet valid, loss of fix, a 20-minute outage, a 5 ms PPS phase step, an inserted leap second both with and without advance notice, and the signal-strength calculation. Each scenario checks the time the server would hand out against the simulated truth. It exercises the logic only; it says nothing about real capture jitter or network delay.
 
 ## Testing without a receiver: `gnss_sim`
 
@@ -146,7 +147,7 @@ At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports wh
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.3.2
+  - source: github://davidcoulson/esphome-pps-ntp@v0.3.3
     components: [pps_ntp, gnss_sim]
 
 gnss_sim:

@@ -60,6 +60,7 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void set_require_utc_valid(bool require) { this->require_utc_valid_ = require; }
 
   void set_satellites_sensor(sensor::Sensor *s) { this->satellites_sensor_ = s; }
+  void set_signal_strength_sensor(sensor::Sensor *s) { this->signal_strength_sensor_ = s; }
   void set_frequency_offset_sensor(sensor::Sensor *s) { this->frequency_offset_sensor_ = s; }
   void set_pps_jitter_sensor(sensor::Sensor *s) { this->pps_jitter_sensor_ = s; }
   void set_requests_sensor(sensor::Sensor *s) { this->requests_sensor_ = s; }
@@ -88,6 +89,8 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void feed_byte_(uint8_t byte);
   void handle_nmea_(char *line);
   void handle_rmc_(char **fields, int count);
+  void handle_gsv_(char **fields, int count);
+  void finalize_cno_();
   void handle_ubx_(uint8_t msg_class, uint8_t msg_id, const uint8_t *payload, uint16_t len);
   void send_ubx_(uint8_t msg_class, uint8_t msg_id, const uint8_t *payload, uint16_t len);
   void start_baud_switch_();
@@ -190,6 +193,13 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   uint32_t ubx_len_{0};
   uint32_t ubx_expected_{0};  // 32-bit: 4 + a 16-bit length + 2 doesn't fit in 16
   int satellites_{-1};
+  // Mean carrier-to-noise density over the satellites the receiver is tracking, accumulated across one
+  // epoch's GSV sentences (every constellation) and finalised when the next RMC starts the following epoch
+  float cno_mean_{0};
+  bool cno_valid_{false};
+  uint32_t cno_sum_{0};
+  uint16_t cno_count_{0};
+  bool cno_saw_gsv_{false};
 
   // Baud switching for legacy u-blox modules
   enum class BaudState : uint8_t { OFF, PROBE, VERIFY, RETRY_WAIT, DONE };
@@ -200,6 +210,7 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   bool nmea_ok_since_switch_{false};
 
   sensor::Sensor *satellites_sensor_{nullptr};
+  sensor::Sensor *signal_strength_sensor_{nullptr};
   sensor::Sensor *frequency_offset_sensor_{nullptr};
   sensor::Sensor *pps_jitter_sensor_{nullptr};
   sensor::Sensor *requests_sensor_{nullptr};

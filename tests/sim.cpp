@@ -23,6 +23,8 @@ struct Sim : PPSNTPServer {
   uart::UARTComponent uart;
   InternalGPIOPin pin;
   sensor::Sensor sats;
+  sensor::Sensor cno;
+  bool tracking = true;  // false: satellites in view but none tracked (e.g. antenna unplugged)
   std::mt19937 rng{42};
 
   // Receiver behaviour, scriptable per test
@@ -53,6 +55,7 @@ struct Sim : PPSNTPServer {
     this->parent_ = &uart;
     this->set_pps_pin(&pin);
     this->set_satellites_sensor(&sats);
+    this->set_signal_strength_sensor(&cno);
   }
 
   static std::string nmea(const std::string &body) {
@@ -91,6 +94,15 @@ struct Sim : PPSNTPServer {
     snprintf(body, sizeof(body), "GPGGA,%02d%02d%02d.00,4124.8963,N,08151.6838,W,1,09,0.9,250.0,M,-33.0,M,,",
              tm.tm_hour, tm.tm_min, tm.tm_sec);
     rx(nmea(body));
+    // Two GSV messages: 6 tracked satellites (45+38+41+33+29+22 = 208, mean 34.667) and one in view
+    // but untracked, whose empty C/N0 field must not count
+    if (tracking) {
+      rx(nmea("GPGSV,2,1,06,02,23,297,45,05,65,265,38,12,28,207,41,13,44,128,33"));
+      rx(nmea("GPGSV,2,2,06,15,71,064,29,18,32,312,22,20,18,156,"));
+    } else {
+      rx(nmea("GPGSV,2,1,06,02,23,297,,05,65,265,,12,28,207,,13,44,128,"));
+      rx(nmea("GPGSV,2,2,06,15,71,064,,18,32,312,,20,18,156,"));
+    }
   }
 
   // Watch what the component transmits: answer polls, obey CFG-PRT
@@ -322,6 +334,17 @@ int main(int argc, char **argv) {
     s.worst_served_error_us = 0; s.run(120);
     check(s.silent == silent_before, "no discipline reset, never goes silent");
     check(std::fabs(s.worst_served_error_us) < 50, "correct from the first second after the leap");
+  }
+
+  begin("N. Signal strength (mean C/N0 of tracked satellites)");
+  {
+    Sim s; s.setup(); s.run(20); s.update();
+    printf("    reported %.2f dB-Hz (expected 34.67)\n", s.cno.state);
+    check(std::fabs(s.cno.state - 208.0 / 6.0) < 0.01, "mean over tracked satellites, ignoring untracked");
+    s.tracking = false; s.run(5); s.update();
+    check(s.cno.state == 0.0f, "reads 0 when nothing is tracked");
+    s.tracking = true; s.run(5); s.update();
+    check(std::fabs(s.cno.state - 208.0 / 6.0) < 0.01, "recovers");
   }
 
   printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED", failures, failures == 1 ? "" : "s");

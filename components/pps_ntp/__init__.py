@@ -34,6 +34,7 @@ CONF_SYNCED = "synced"
 CONF_FREQUENCY_OFFSET = "frequency_offset"
 CONF_PPS_JITTER = "pps_jitter"
 CONF_REQUESTS = "requests"
+CONF_SIGNAL_STRENGTH = "signal_strength"
 CONF_FIT_WINDOW = "fit_window"
 CONF_MAX_RESIDUAL = "max_residual"
 CONF_REFID = "refid"
@@ -44,6 +45,7 @@ TRANSPORT_SOCKET = "socket"
 TRANSPORT_RAW_LWIP = "raw_lwip"
 
 UNIT_MICROSECOND = "µs"
+UNIT_DB_HZ = "dB-Hz"  # carrier-to-noise density, the usual GNSS signal-strength unit
 
 # Variants with an MCPWM capture unit, which latches the PPS edge in hardware
 MCPWM_VARIANTS = (
@@ -108,6 +110,14 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_SATELLITES): sensor.sensor_schema(
                 icon="mdi:satellite-variant",
                 accuracy_decimals=0,
+                state_class=STATE_CLASS_MEASUREMENT,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
+            # Mean C/N0 of the tracked satellites: the number to compare antenna positions with
+            cv.Optional(CONF_SIGNAL_STRENGTH): sensor.sensor_schema(
+                unit_of_measurement=UNIT_DB_HZ,
+                icon="mdi:antenna",
+                accuracy_decimals=1,
                 state_class=STATE_CLASS_MEASUREMENT,
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
             ),
@@ -203,6 +213,7 @@ async def to_code(config):
 
     for key, setter in (
         (CONF_SATELLITES, "set_satellites_sensor"),
+        (CONF_SIGNAL_STRENGTH, "set_signal_strength_sensor"),
         (CONF_FREQUENCY_OFFSET, "set_frequency_offset_sensor"),
         (CONF_PPS_JITTER, "set_pps_jitter_sensor"),
         (CONF_REQUESTS, "set_requests_sensor"),

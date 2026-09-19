@@ -25,7 +25,7 @@ esp32:
     type: esp-idf
 
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.3.2
+  - source: github://davidcoulson/esphome-pps-ntp@v0.3.3
     components: [pps_ntp]
 
 logger:

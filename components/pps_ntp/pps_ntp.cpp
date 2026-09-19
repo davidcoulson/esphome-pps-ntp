@@ -306,6 +306,8 @@ void PPSNTPServer::update() {
   ClockModel model = this->get_model_();
   if (this->satellites_sensor_ != nullptr && this->satellites_ >= 0)
     this->satellites_sensor_->publish_state(this->satellites_);
+  if (this->signal_strength_sensor_ != nullptr && this->cno_valid_)
+    this->signal_strength_sensor_->publish_state(this->cno_mean_);
   if (this->frequency_offset_sensor_ != nullptr && model.valid)
     this->frequency_offset_sensor_->publish_state(model.local_us_per_s - 1e6);
   if (this->pps_jitter_sensor_ != nullptr && model.valid)
@@ -333,12 +335,12 @@ void PPSNTPServer::log_status_() {
   unsigned stack_free = this->task_ != nullptr ? uxTaskGetStackHighWaterMark(this->task_) : 0;
   ESP_LOGD(TAG,
            "edges=%u accepted=%u nmea=%u/%u bad ubx=%u utc_valid=%s fit=%d/%d confirmed=%u residual=%.1fus "
-           "jitter=%.1fus sats=%d stack_free=%u",
+           "jitter=%.1fus sats=%d cno=%.1f stack_free=%u",
            static_cast<unsigned>(this->edges_seen_), static_cast<unsigned>(this->pulses_accepted_),
            static_cast<unsigned>(this->nmea_ok_), static_cast<unsigned>(this->nmea_bad_),
            static_cast<unsigned>(this->ubx_frames_), YESNO(this->utc_trusted_), this->hist_count_, this->fit_window_,
            static_cast<unsigned>(this->label_confirmations_), this->last_residual_us_, std::sqrt(this->jitter_sq_us_),
-           this->satellites_, stack_free);
+           this->satellites_, this->cno_mean_, stack_free);
 }
 
 void PPSNTPServer::dump_config() {
@@ -376,6 +378,7 @@ void PPSNTPServer::dump_config() {
   }
   LOG_UPDATE_INTERVAL(this);
   LOG_SENSOR("  ", "Satellites", this->satellites_sensor_);
+  LOG_SENSOR("  ", "Signal Strength", this->signal_strength_sensor_);
   LOG_SENSOR("  ", "Frequency Offset", this->frequency_offset_sensor_);
   LOG_SENSOR("  ", "PPS Jitter", this->pps_jitter_sensor_);
   LOG_SENSOR("  ", "Requests", this->requests_sensor_);
@@ -615,11 +618,11 @@ void PPSNTPServer::handle_nmea_(char *line) {
   this->nmea_ok_++;
   this->nmea_ok_since_switch_ = true;
 
-  char *fields[20];
+  char *fields[24];
   int count = 0;
   char *p = line;
   fields[count++] = p;
-  while ((p = strchr(p, ',')) != nullptr && count < 20) {
+  while ((p = strchr(p, ',')) != nullptr && count < 24) {
     *p++ = '\0';
     fields[count++] = p;
   }
@@ -629,9 +632,13 @@ void PPSNTPServer::handle_nmea_(char *line) {
     return;
   const char *type = fields[0] + 3;
   if (strcmp(type, "RMC") == 0) {
+    // RMC opens each epoch's burst, so the GSV sentences accumulated since the last one are complete
+    this->finalize_cno_();
     this->handle_rmc_(fields, count);
   } else if (strcmp(type, "GGA") == 0 && count > 7 && fields[7][0] != '\0') {
     this->satellites_ = atoi(fields[7]);
+  } else if (strcmp(type, "GSV") == 0) {
+    this->handle_gsv_(fields, count);
   }
 }
 
@@ -718,6 +725,31 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
   this->last_pulse_labelled_ = true;
   this->last_pulse_utc_s_ = utc_s;
   this->accept_pulse_(this->last_pulse_us_, utc_s);
+}
+
+// $ttGSV,totalMsgs,msgNum,satsInView,{prn,elevation,azimuth,cno} x up to 4[,signalId]
+void PPSNTPServer::handle_gsv_(char **fields, int count) {
+  this->cno_saw_gsv_ = true;
+  for (int i = 7; i < count; i += 4) {  // the first C/N0 is field 7, then every fourth
+    if (fields[i][0] == '\0')
+      continue;  // in view but not tracked
+    int cno = atoi(fields[i]);
+    if (cno <= 0 || cno > 99)
+      continue;
+    this->cno_sum_ += cno;
+    this->cno_count_++;
+  }
+}
+
+void PPSNTPServer::finalize_cno_() {
+  // Zero tracked satellites is a real reading (a disconnected antenna), but only once GSV has been seen
+  if (this->cno_saw_gsv_) {
+    this->cno_mean_ = this->cno_count_ > 0 ? static_cast<float>(this->cno_sum_) / this->cno_count_ : 0.0f;
+    this->cno_valid_ = true;
+  }
+  this->cno_sum_ = 0;
+  this->cno_count_ = 0;
+  this->cno_saw_gsv_ = false;
 }
 
 void PPSNTPServer::handle_ubx_(uint8_t msg_class, uint8_t msg_id, const uint8_t *payload, uint16_t len) {
