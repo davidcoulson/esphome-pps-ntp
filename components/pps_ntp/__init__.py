@@ -1,6 +1,14 @@
 import esphome.codegen as cg
 from esphome import pins
-from esphome.components import binary_sensor, sensor, uart
+from esphome.components import binary_sensor, esp32, sensor, uart
+from esphome.components.esp32 import (
+    VARIANT_ESP32,
+    VARIANT_ESP32C5,
+    VARIANT_ESP32C6,
+    VARIANT_ESP32H2,
+    VARIANT_ESP32P4,
+    VARIANT_ESP32S3,
+)
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_ID,
@@ -18,6 +26,7 @@ AUTO_LOAD = ["sensor", "binary_sensor"]
 CODEOWNERS = ["@davidcoulson"]
 
 CONF_PPS_PIN = "pps_pin"
+CONF_HARDWARE_CAPTURE = "hardware_capture"
 CONF_GNSS_BAUD_RATE = "gnss_baud_rate"
 CONF_HOLDOVER = "holdover"
 CONF_SYNCED = "synced"
@@ -26,6 +35,16 @@ CONF_PPS_JITTER = "pps_jitter"
 CONF_REQUESTS = "requests"
 
 UNIT_MICROSECOND = "µs"
+
+# Variants with an MCPWM capture unit, which latches the PPS edge in hardware
+MCPWM_VARIANTS = (
+    VARIANT_ESP32,
+    VARIANT_ESP32S3,
+    VARIANT_ESP32C5,
+    VARIANT_ESP32C6,
+    VARIANT_ESP32H2,
+    VARIANT_ESP32P4,
+)
 
 pps_ntp_ns = cg.esphome_ns.namespace("pps_ntp")
 PPSNTPServer = pps_ntp_ns.class_(
@@ -38,6 +57,8 @@ CONFIG_SCHEMA = cv.All(
             cv.GenerateID(): cv.declare_id(PPSNTPServer),
             cv.Required(CONF_PPS_PIN): pins.internal_gpio_input_pin_schema,
             cv.Optional(CONF_PORT, default=123): cv.port,
+            # Timestamp PPS with the MCPWM capture unit where the chip has one; false forces the GPIO interrupt
+            cv.Optional(CONF_HARDWARE_CAPTURE, default=True): cv.boolean,
             # Raise an older u-blox module (NEO-6M/7M/M8, GT-U7) to this baud using legacy UBX-CFG-PRT
             cv.Optional(CONF_GNSS_BAUD_RATE): cv.one_of(
                 9600, 19200, 38400, 57600, 115200, 230400, int=True
@@ -94,6 +115,9 @@ async def to_code(config):
 
     pin = await cg.gpio_pin_expression(config[CONF_PPS_PIN])
     cg.add(var.set_pps_pin(pin))
+    if config[CONF_HARDWARE_CAPTURE] and esp32.get_esp32_variant() in MCPWM_VARIANTS:
+        esp32.include_builtin_idf_component("esp_driver_mcpwm")
+        cg.add_define("USE_PPS_NTP_MCPWM")
     cg.add(var.set_port(config[CONF_PORT]))
     cg.add(var.set_holdover_s(config[CONF_HOLDOVER].total_seconds))
     if CONF_GNSS_BAUD_RATE in config:

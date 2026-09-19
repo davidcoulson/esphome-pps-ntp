@@ -10,7 +10,12 @@
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/uart/uart.h"
 #include "esphome/core/component.h"
+#include "esphome/core/defines.h"
 #include "esphome/core/hal.h"
+
+#ifdef USE_PPS_NTP_MCPWM
+#include <driver/mcpwm_cap.h>
+#endif
 
 namespace esphome::pps_ntp {
 
@@ -47,6 +52,11 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   static void ntp_task(void *arg);
   void ntp_loop_();
 
+  // PPS capture
+  bool setup_capture_();
+  void poll_capture_();
+  void poll_isr_();
+
   // GNSS input
   void feed_byte_(uint8_t byte);
   void handle_nmea_(char *line);
@@ -73,6 +83,18 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   volatile int64_t isr_pulse_us_{0};
   volatile uint32_t isr_pulse_count_{0};
   uint32_t seen_pulse_count_{0};
+
+  // MCPWM hardware capture: the edge time is latched by the peripheral, so interrupt latency and
+  // flash-write stalls can't move it
+  bool hw_capture_{false};
+#ifdef USE_PPS_NTP_MCPWM
+  mcpwm_cap_timer_handle_t cap_timer_{nullptr};
+  mcpwm_cap_channel_handle_t cap_pps_{nullptr};  // latches on the PPS rising edge
+  mcpwm_cap_channel_handle_t cap_ref_{nullptr};  // software-latched to tie capture ticks to esp_timer
+  double cap_ticks_per_us_{80.0};
+  uint32_t last_cap_value_{0};
+  int cap_group_{-1};
+#endif
 
   // Pulses and labels
   int64_t last_pulse_us_{0};  // most recent raw pulse, labelled or not

@@ -78,8 +78,11 @@ void IRAM_ATTR PPSNTPServer::pps_isr(PPSNTPServer *self) {
 
 void PPSNTPServer::setup() {
   this->boot_ms_ = millis();
-  this->pps_pin_->setup();
-  this->pps_pin_->attach_interrupt(PPSNTPServer::pps_isr, this, gpio::INTERRUPT_RISING_EDGE);
+  this->hw_capture_ = this->setup_capture_();
+  if (!this->hw_capture_) {
+    this->pps_pin_->setup();
+    this->pps_pin_->attach_interrupt(PPSNTPServer::pps_isr, this, gpio::INTERRUPT_RISING_EDGE);
+  }
 
   this->original_baud_ = this->parent_->get_baud_rate();
   if (this->gnss_baud_rate_ != 0 && this->gnss_baud_rate_ != this->original_baud_)
@@ -90,29 +93,30 @@ void PPSNTPServer::loop() {
   // The socket API needs lwIP's tcpip thread, which the network component only brings up after
   // our setup(); calling socket() earlier asserts on an uninitialised lwIP mutex
   if (this->task_ == nullptr && network::is_connected()) {
-    if (xTaskCreate(PPSNTPServer::ntp_task, "pps_ntp", 4096, this, 10, &this->task_) != pdPASS) {
+    // Run on the core the ESPHome loop isn't on, so request timestamps don't wait out its critical sections
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+    BaseType_t core = xPortGetCoreID() == 0 ? 1 : 0;
+#else
+    BaseType_t core = tskNO_AFFINITY;
+#endif
+    if (xTaskCreatePinnedToCore(PPSNTPServer::ntp_task, "pps_ntp", 4096, this, 10, &this->task_, core) != pdPASS) {
       ESP_LOGE(TAG, "Could not start NTP server task");
       this->mark_failed();
       return;
     }
-    ESP_LOGI(TAG, "Network up; serving NTP on UDP port %u", this->port_);
+    ESP_LOGI(TAG, "Network up; serving NTP on UDP port %u (core %d)", this->port_, static_cast<int>(core));
+  }
+
+  // Pulses before NMEA: the RMC that labels a pulse must find that pulse already recorded
+  if (this->hw_capture_) {
+    this->poll_capture_();
+  } else {
+    this->poll_isr_();
   }
 
   uint8_t byte;
   while (this->available() > 0 && this->read_byte(&byte))
     this->feed_byte_(byte);
-
-  // Take the latest pulse from the ISR; re-read if one landed while copying the 64-bit timestamp
-  uint32_t count = this->isr_pulse_count_;
-  if (count != this->seen_pulse_count_) {
-    int64_t pulse_us = this->isr_pulse_us_;
-    while (count != this->isr_pulse_count_) {
-      count = this->isr_pulse_count_;
-      pulse_us = this->isr_pulse_us_;
-    }
-    this->seen_pulse_count_ = count;
-    this->handle_pulse_(pulse_us);
-  }
 
   this->service_baud_switch_();
 
@@ -136,6 +140,103 @@ void PPSNTPServer::loop() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// PPS capture
+
+bool PPSNTPServer::setup_capture_() {
+#ifdef USE_PPS_NTP_MCPWM
+  mcpwm_capture_timer_config_t timer_config = {};
+  timer_config.clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT;
+  for (int group = 0; group < 2 && this->cap_timer_ == nullptr; group++) {
+    timer_config.group_id = group;
+    if (mcpwm_new_capture_timer(&timer_config, &this->cap_timer_) == ESP_OK)
+      this->cap_group_ = group;
+  }
+  if (this->cap_timer_ == nullptr) {
+    ESP_LOGW(TAG, "No free MCPWM capture timer; falling back to the GPIO interrupt");
+    return false;
+  }
+
+  mcpwm_capture_channel_config_t channel_config = {};
+  channel_config.gpio_num = this->pps_pin_->get_pin();
+  channel_config.prescale = 1;
+  channel_config.flags.pos_edge = true;
+  esp_err_t err = mcpwm_new_capture_channel(this->cap_timer_, &channel_config, &this->cap_pps_);
+  if (err == ESP_OK) {
+    channel_config.gpio_num = -1;  // software trigger only
+    err = mcpwm_new_capture_channel(this->cap_timer_, &channel_config, &this->cap_ref_);
+  }
+  // No callbacks are registered, so the driver never installs an interrupt; loop() polls the latches
+  if (err == ESP_OK)
+    err = mcpwm_capture_channel_enable(this->cap_pps_);
+  if (err == ESP_OK)
+    err = mcpwm_capture_channel_enable(this->cap_ref_);
+  if (err == ESP_OK)
+    err = mcpwm_capture_timer_enable(this->cap_timer_);
+  if (err == ESP_OK)
+    err = mcpwm_capture_timer_start(this->cap_timer_);
+  uint32_t resolution_hz = 0;
+  if (err == ESP_OK)
+    err = mcpwm_capture_timer_get_resolution(this->cap_timer_, &resolution_hz);
+  if (err != ESP_OK || resolution_hz == 0) {
+    ESP_LOGW(TAG, "MCPWM capture setup failed (%s); falling back to the GPIO interrupt", esp_err_to_name(err));
+    if (this->cap_pps_ != nullptr)
+      mcpwm_del_capture_channel(this->cap_pps_);
+    if (this->cap_ref_ != nullptr)
+      mcpwm_del_capture_channel(this->cap_ref_);
+    mcpwm_del_capture_timer(this->cap_timer_);
+    this->cap_pps_ = this->cap_ref_ = nullptr;
+    this->cap_timer_ = nullptr;
+    return false;
+  }
+  this->cap_ticks_per_us_ = resolution_hz / 1e6;
+  mcpwm_capture_get_latched_value(this->cap_pps_, &this->last_cap_value_);
+  return true;
+#else
+  return false;
+#endif
+}
+
+void PPSNTPServer::poll_capture_() {
+#ifdef USE_PPS_NTP_MCPWM
+  uint32_t pulse_ticks;
+  mcpwm_capture_get_latched_value(this->cap_pps_, &pulse_ticks);
+  if (pulse_ticks == this->last_cap_value_)
+    return;
+  this->last_cap_value_ = pulse_ticks;
+
+  // Latch the capture timer "now" between two esp_timer reads, with nothing able to preempt us,
+  // to place the hardware-captured edge on the esp_timer timeline
+  static portMUX_TYPE ref_lock = portMUX_INITIALIZER_UNLOCKED;
+  portENTER_CRITICAL(&ref_lock);
+  int64_t before_us = esp_timer_get_time();
+  mcpwm_capture_channel_trigger_soft_catch(this->cap_ref_);
+  int64_t after_us = esp_timer_get_time();
+  portEXIT_CRITICAL(&ref_lock);
+  uint32_t ref_ticks;
+  mcpwm_capture_get_latched_value(this->cap_ref_, &ref_ticks);
+
+  // The 32-bit counter wraps every ~53 s (80 MHz); the signed difference is valid for ~26 s
+  int32_t ticks_since_edge = static_cast<int32_t>(ref_ticks - pulse_ticks);
+  double edge_us = (before_us + after_us) * 0.5 - ticks_since_edge / this->cap_ticks_per_us_;
+  this->handle_pulse_(llround(edge_us));
+#endif
+}
+
+void PPSNTPServer::poll_isr_() {
+  // Take the latest pulse from the ISR; re-read if one landed while copying the 64-bit timestamp
+  uint32_t count = this->isr_pulse_count_;
+  if (count == this->seen_pulse_count_)
+    return;
+  int64_t pulse_us = this->isr_pulse_us_;
+  while (count != this->isr_pulse_count_) {
+    count = this->isr_pulse_count_;
+    pulse_us = this->isr_pulse_us_;
+  }
+  this->seen_pulse_count_ = count;
+  this->handle_pulse_(pulse_us);
+}
+
 void PPSNTPServer::update() {
   ClockModel model = this->get_model_();
   if (this->satellites_sensor_ != nullptr && this->satellites_ >= 0)
@@ -153,6 +254,15 @@ void PPSNTPServer::update() {
 void PPSNTPServer::dump_config() {
   ESP_LOGCONFIG(TAG, "PPS NTP Server:");
   LOG_PIN("  PPS Pin: ", this->pps_pin_);
+#ifdef USE_PPS_NTP_MCPWM
+  if (this->hw_capture_) {
+    ESP_LOGCONFIG(TAG, "  PPS capture: MCPWM hardware (group %d, %.0f MHz)", this->cap_group_, this->cap_ticks_per_us_);
+  } else {
+    ESP_LOGCONFIG(TAG, "  PPS capture: GPIO interrupt (MCPWM unavailable)");
+  }
+#else
+  ESP_LOGCONFIG(TAG, "  PPS capture: GPIO interrupt");
+#endif
   ESP_LOGCONFIG(TAG,
                 "  Port: %u\n"
                 "  Holdover: %us",
