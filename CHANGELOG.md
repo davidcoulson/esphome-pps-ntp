@@ -4,6 +4,9 @@ Hardware status: run on an ESP32-S3-ETH against the `gnss_sim` emulator. Not yet
 
 ## Unreleased
 
+## v0.5.2 - 2026-09-20
+- Repeat the constellation report in `dump_config()`. ESPHome replays the config dump to every log client that connects, so a one-shot INFO line at boot was in practice invisible.
+
 ## v0.5.1 - 2026-09-20
 - Fix: the "receiver doesn't speak UBX" fallback keyed off *any* UBX frame, so a receiver that answered the new `CFG-GNSS` poll but not `NAV-TIMEUTC` would never be trusted and never serve. It now keys off `NAV-TIMEUTC` specifically.
 

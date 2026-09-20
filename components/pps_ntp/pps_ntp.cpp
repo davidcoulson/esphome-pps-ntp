@@ -401,6 +401,10 @@ void PPSNTPServer::dump_config() {
     ESP_LOGCONFIG(TAG, "  GNSS baud rate: %u (from %u)", static_cast<unsigned>(this->gnss_baud_rate_),
                   static_cast<unsigned>(this->original_baud_));
   }
+  if (this->constellations_[0] != '\0') {
+    ESP_LOGCONFIG(TAG, "  Receiver constellations: %s\n  Hardware tracking channels: %u", this->constellations_,
+                  this->tracking_channels_);
+  }
   LOG_UPDATE_INTERVAL(this);
   LOG_SENSOR("  ", "Satellites", this->satellites_sensor_);
   LOG_SENSOR("  ", "Signal Strength", this->signal_strength_sensor_);
@@ -800,18 +804,20 @@ void PPSNTPServer::handle_cfg_gnss_(const uint8_t *payload, uint16_t len) {
   if (len < 4u + blocks * 8u)
     return;
   static const char *const NAMES[] = {"GPS", "SBAS", "Galileo", "BeiDou", "IMES", "QZSS", "GLONASS", "NavIC"};
-  char list[160];
+  char *list = this->constellations_;
+  const size_t capacity = sizeof(this->constellations_);
   size_t pos = 0;
   for (uint8_t i = 0; i < blocks; i++) {
     const uint8_t *block = payload + 4 + i * 8;
     uint8_t id = block[0];
     const char *name = id < sizeof(NAMES) / sizeof(NAMES[0]) ? NAMES[id] : "?";
-    int written = snprintf(list + pos, sizeof(list) - pos, "%s%s(%s, max %u ch)", pos > 0 ? ", " : "", name,
+    int written = snprintf(list + pos, capacity - pos, "%s%s(%s, max %u ch)", pos > 0 ? ", " : "", name,
                            (block[4] & 0x01) ? "on" : "off", block[2]);
-    if (written < 0 || pos + written >= sizeof(list))
+    if (written < 0 || pos + static_cast<size_t>(written) >= capacity)
       break;
     pos += written;
   }
+  this->tracking_channels_ = payload[1];
   ESP_LOGI(TAG, "Receiver constellations: %s; %u hardware tracking channels", list, payload[1]);
 }
 

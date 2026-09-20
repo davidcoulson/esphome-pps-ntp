@@ -190,6 +190,10 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   bool stationary_{true};   // tell the receiver it isn't moving (UBX-CFG-NAV5)
   bool trim_nmea_{false};   // silence the sentences we don't read (UBX-CFG-MSG)
   bool receiver_configured_{false};
+  // Kept so dump_config() can repeat it: ESPHome replays the config dump to every log client that
+  // connects, while a one-shot INFO line at boot is seen only by whoever was already watching
+  char constellations_[160]{};
+  uint8_t tracking_channels_{0};
   bool ubx_absent_warned_{false};
   bool server_started_{false};
   uint32_t boot_ms_{0};
