@@ -178,13 +178,13 @@ void PPSNTPServer::loop() {
     ESP_LOGI(TAG, "Leap second complete");
   }
 
-  if (!this->ubx_seen_ && !this->utc_trusted_ && !this->ubx_absent_warned_ &&
+  if (!this->timeutc_seen_ && !this->utc_trusted_ && !this->ubx_absent_warned_ &&
       now_ms - this->boot_ms_ >= UBX_ABSENT_TIMEOUT_MS) {
     this->ubx_absent_warned_ = true;
     if (this->require_utc_valid_) {
-      ESP_LOGW(TAG, "Receiver does not answer UBX polls and require_utc_valid is set; staying unsynchronised");
+      ESP_LOGW(TAG, "Receiver does not answer NAV-TIMEUTC and require_utc_valid is set; staying unsynchronised");
     } else {
-      ESP_LOGW(TAG, "Receiver does not answer UBX polls; trusting NMEA UTC without leap-second confirmation");
+      ESP_LOGW(TAG, "Receiver does not answer NAV-TIMEUTC; trusting NMEA UTC without leap-second confirmation");
       this->utc_trusted_ = true;
       this->publish_model_();
     }
@@ -845,6 +845,7 @@ void PPSNTPServer::handle_ubx_(uint8_t msg_class, uint8_t msg_id, const uint8_t 
   }
   if (msg_class != 0x01 || msg_id != 0x21 || len < 20)
     return;
+  this->timeutc_seen_ = true;
   bool valid_utc = (payload[19] & 0x04) != 0;  // NAV-TIMEUTC valid.validUTC: leap seconds are known
   if (valid_utc != this->utc_trusted_) {
     ESP_LOGI(TAG, "Receiver UTC %s", valid_utc ? "confirmed (leap seconds known)" : "not yet valid");

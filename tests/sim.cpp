@@ -32,7 +32,8 @@ struct Sim : PPSNTPServer {
   bool module_accepts_cfg_prt = true;
   bool fix = true;
   bool pps_on = true;
-  bool answers_ubx = true;
+  bool answers_ubx = true;      // answers UBX at all
+  bool answers_timeutc = true;  // answers NAV-TIMEUTC specifically (some receivers know only some messages)
   bool utc_valid = true;
   int64_t date_offset_s = 0;   // e.g. -1024 weeks
   int64_t t0 = T0;             // UTC of pulse k = 0
@@ -119,7 +120,7 @@ struct Sim : PPSNTPServer {
       if (tx_seen + 8 + len > tx.size()) break;
       uint8_t cls = tx[tx_seen + 2], id = tx[tx_seen + 3];
       bool heard = uart.tx_baud[tx_seen] == module_baud;  // the baud at the moment it was sent
-      if (heard && cls == 0x01 && id == 0x21 && answers_ubx) {
+      if (heard && cls == 0x01 && id == 0x21 && answers_ubx && answers_timeutc) {
         std::vector<uint8_t> p(20, 0);
         p[19] = utc_valid ? 0x07 : 0x03;
         if (uart.baud == module_baud) rx_raw(ubx(0x01, 0x21, p));
@@ -132,7 +133,7 @@ struct Sim : PPSNTPServer {
         p[12] = to_event & 0xFF; p[13] = (to_event >> 8) & 0xFF; p[14] = (to_event >> 16) & 0xFF; p[15] = (to_event >> 24) & 0xFF;
         p[23] = 0x03;
         rx_raw(ubx(0x01, 0x26, p));
-      } else if (heard && cls == 0x06 && id == 0x3E && len == 0) {
+      } else if (heard && cls == 0x06 && id == 0x3E && len == 0 && answers_ubx) {
         // CFG-GNSS poll: a NEO-7M-like answer, GLONASS present but switched off
         std::vector<uint8_t> p = {0x00, 22, 22, 4};
         auto block = [&](uint8_t gnss_id, uint8_t max_ch, bool on) {
@@ -140,7 +141,7 @@ struct Sim : PPSNTPServer {
         };
         block(0, 16, true); block(1, 3, true); block(5, 3, true); block(6, 14, false);
         rx_raw(ubx(0x06, 0x3E, p));
-      } else if (heard && (cls == 0x06 && (id == 0x24 || id == 0x01))) {
+      } else if (heard && answers_ubx && (cls == 0x06 && (id == 0x24 || id == 0x01))) {
         std::vector<uint8_t> ack = {cls, id};
         rx_raw(ubx(0x05, 0x01, ack));
       } else if (heard && cls == 0x06 && id == 0x00 && module_accepts_cfg_prt) {
@@ -292,6 +293,9 @@ int main(int argc, char **argv) {
     check(a.served > 0 && a.first_synced_s >= 60, "default: trusted only after the 60 s fallback");
     Sim b; b.answers_ubx = false; b.set_require_utc_valid(true); b.setup(); b.run(300);
     check(b.served == 0 && b.unsynced > 0, "require_utc_valid: never claims stratum 1");
+    // Answers CFG-GNSS but not NAV-TIMEUTC: the fallback must still fire, or it would never serve
+    Sim c; c.answers_timeutc = false; c.setup(); c.run(90);
+    check(c.served > 0 && c.first_synced_s >= 60, "answers some UBX but not NAV-TIMEUTC: still falls back");
   }
 
   begin("H. UTC not yet valid for 200 s (cold start), then valid");

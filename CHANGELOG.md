@@ -4,6 +4,15 @@ Hardware status: run on an ESP32-S3-ETH against the `gnss_sim` emulator. Not yet
 
 ## Unreleased
 
+## v0.5.1 - 2026-09-20
+- Fix: the "receiver doesn't speak UBX" fallback keyed off *any* UBX frame, so a receiver that answered the new `CFG-GNSS` poll but not `NAV-TIMEUTC` would never be trusted and never serve. It now keys off `NAV-TIMEUTC` specifically.
+
+## v0.5.0 - 2026-09-20
+- `stationary` (default on): put the receiver in its stationary dynamic model at boot.
+- `trim_nmea` (default off): silence the NMEA sentences the component doesn't read.
+- Poll `UBX-CFG-GNSS` once and report which constellations the receiver has and which are enabled.
+- Log a warning when the receiver rejects one of our commands (UBX-ACK-NAK).
+
 ## v0.4.0 - 2026-09-20
 - New sensors: `strong_satellites` (with `strong_signal_threshold`), `hdop`, `rejected_pulses`, `nmea_errors` and `pulse_age`.
 - The status line reports `strong` and `hdop`, and `stack_free` prints `n/a` on the raw lwIP transport instead of 0.

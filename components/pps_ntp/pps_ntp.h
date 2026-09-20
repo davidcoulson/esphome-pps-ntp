@@ -174,7 +174,8 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   portMUX_TYPE lock_ = portMUX_INITIALIZER_UNLOCKED;
   ClockModel model_;
   bool utc_trusted_{false};
-  bool ubx_seen_{false};
+  bool ubx_seen_{false};       // any UBX frame at all, for diagnostics
+  bool timeutc_seen_{false};   // a NAV-TIMEUTC reply specifically: the only message that can confirm UTC
   // Leap second state, in the loop task; copied into the model on every publish
   int32_t leap_adj_s_{0};
   int8_t leap_change_{0};

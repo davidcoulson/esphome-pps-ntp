@@ -26,12 +26,13 @@ GNSS UART ─► NMEA RMC (which second) ┤
    - Stray edges (noise on the PPS line) are ignored. Three misaligned edges in a row, or three RMC disagreements, reset the fit.
    - Dates before 2026 are treated as a GPS week-number rollover (old and clone receivers) and moved forward by whole multiples of 1024 weeks.
 3. **Discipline.** A least-squares fit over the last 64 pulses gives the crystal's rate and phase. The ESP32 system clock is left alone; NTP timestamps are computed straight from the fit.
-4. **Leap-second safety.** The receiver is polled with `UBX-NAV-TIMEUTC`, and the server reports itself as unsynchronised until the receiver confirms UTC is valid. (After a cold start, u-blox receivers can report time with the wrong leap-second count for up to about 12.5 minutes.) Receivers that don't answer UBX fall back to NMEA-only after 60 s.
-5. **Leap seconds.** The fit runs on a continuous count of seconds, so its history stays linear across a leap, and UTC is derived from it with an adjustment that changes by one at the leap.
+4. **Receiver setup.** Once the link has settled, the receiver is put into its stationary dynamic model, optionally has its unused NMEA sentences silenced, and is asked which constellations it supports — reported once, e.g. `GPS(on, max 16 ch), SBAS(on, max 3 ch), QZSS(on, max 3 ch), GLONASS(off, max 14 ch); 22 hardware tracking channels`. These are RAM-only settings, re-applied every boot, so nothing is written to the receiver's flash. A rejected command is logged as a warning.
+5. **Leap-second safety.** The receiver is polled with `UBX-NAV-TIMEUTC`, and the server reports itself as unsynchronised until the receiver confirms UTC is valid. (After a cold start, u-blox receivers can report time with the wrong leap-second count for up to about 12.5 minutes.) Receivers that never answer `NAV-TIMEUTC` fall back to NMEA-only after 60 s, unless `require_utc_valid` is set.
+6. **Leap seconds.** The fit runs on a continuous count of seconds, so its history stays linear across a leap, and UTC is derived from it with an adjustment that changes by one at the leap.
    - **u-blox 8 and later:** the schedule comes from `UBX-NAV-TIMELS`. Clients get LI=1 (or 2) during the final day, and the step happens exactly at midnight. An inserted second is served as a repeat of 23:59:59, as NTP servers conventionally do.
    - **u-blox 6/7 (no NAV-TIMELS):** the leap is taken from the receiver's own `23:59:60` sentence. There is no advance LI, and for roughly 0.1 s (until that sentence arrives) replies are one second fast.
    - Either way the fit is not reset and the server doesn't go silent.
-6. **Serving.** A dedicated FreeRTOS task, pinned to the core the ESPHome loop isn't using, answers NTPv3 and NTPv4 client requests. It timestamps each request as soon as it arrives and each reply just before sending.
+7. **Serving.** A dedicated FreeRTOS task, pinned to the core the ESPHome loop isn't using, answers NTPv3 and NTPv4 client requests. It timestamps each request as soon as it arrives and each reply just before sending.
    - **Synced:** stratum 1, refid `GPS` (configurable). The precision field is 2^-20 s (about 1 µs) with hardware capture and 2^-18 s with the GPIO interrupt.
    - **PPS lost:** keeps serving on the local crystal for `holdover` (stratum 1, with dispersion growing over time).
    - **After holdover:** replies with LI=3 and stratum 16.
@@ -61,7 +62,7 @@ Wiring (example config):
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.4.0
+  - source: github://davidcoulson/esphome-pps-ntp@v0.5.1
     components: [pps_ntp]
 
 uart:
@@ -104,6 +105,8 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 | `fit_window` | `64` | Pulses in the least-squares fit (8–256). Longer windows average out more noise; shorter ones track temperature changes in the crystal faster. |
 | `max_residual` | `1000us` | A pulse further than this from the model is an outlier; three in a row reset the fit. With hardware capture, about `50us` is a reasonable tighter setting once the node has proven stable. |
 | `refid` | `GPS` | NTP reference ID sent to clients (1–4 ASCII characters, e.g. `PPS`). |
+| `stationary` | `true` | Sends `UBX-CFG-NAV5` at boot to put the receiver in its stationary dynamic model. A receiver that knows it cannot be moving constrains its solution, which steadies the time when signals are marginal — worth having on any fixed installation. |
+| `trim_nmea` | `false` | Sends `UBX-CFG-MSG` at boot to silence the NMEA sentences this component doesn't read, keeping RMC, GGA and GSV. Off by default because it changes what the receiver emits. |
 | `require_utc_valid` | `false` | If `true`, never claim stratum 1 until the receiver confirms UTC over UBX. By default a receiver that doesn't answer UBX is trusted after 60 s, which can be one leap-second count off for up to about 12.5 minutes after a cold start. |
 | `transport` | `socket` | `raw_lwip` is **experimental**: it has served a few thousand requests on an ESP32-S3-ETH without trouble, and cut the median round trip by about 0.45 ms and the tail by more (see Limitations), but it hasn't had a long soak. It answers from lwIP's tcpip thread instead of a socket task, which removes the socket mailbox and a task wake-up from the timestamp path. `task_core` can't be combined with it. |
 | `task_core` | auto | Pins the NTP task to core `0` or `1`. By default it runs on the core the ESPHome loop isn't using. Rejected at validation on single-core chips (C2/C3/C5/C6/C61/H2/S2) and on an ESP32 built with `CONFIG_FREERTOS_UNICORE`. A compile-time `#error` catches anything else that ends up single-core. |
@@ -154,7 +157,7 @@ At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports wh
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.4.0
+  - source: github://davidcoulson/esphome-pps-ntp@v0.5.1
     components: [pps_ntp, gnss_sim]
 
 gnss_sim:
