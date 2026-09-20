@@ -61,7 +61,7 @@ Wiring (example config):
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.3.3
+  - source: github://davidcoulson/esphome-pps-ntp@v0.4.0
     components: [pps_ntp]
 
 uart:
@@ -99,6 +99,7 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 | `port` | `123` | UDP port to listen on. |
 | `hardware_capture` | `true` | Timestamp PPS with the MCPWM capture unit where the chip has one. Set to `false` to force the GPIO interrupt. |
 | `gnss_baud_rate` | none | If set, the component first listens at this rate for 1.5 s (the receiver keeps its setting across ESP reboots). Only if that stays quiet does it send the legacy `UBX-CFG-PRT` command at the UART's configured rate, verify the switch, save it with `UBX-CFG-CFG`, and fall back to the original rate if the switch fails. Useful for NEO-6M/7M/M8 modules stuck at 9600. |
+| `strong_signal_threshold` | `35` | The C/N0 in dB-Hz at which a satellite counts towards `strong_satellites`. |
 | `holdover` | `15min` | How long to keep serving stratum 1 after PPS or the fix is lost. |
 | `fit_window` | `64` | Pulses in the least-squares fit (8–256). Longer windows average out more noise; shorter ones track temperature changes in the crystal faster. |
 | `max_residual` | `1000us` | A pulse further than this from the model is an outlier; three in a row reset the fit. With hardware capture, about `50us` is a reasonable tighter setting once the node has proven stable. |
@@ -117,6 +118,11 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 | `frequency_offset` | sensor (ppm) | Measured error of the ESP32 crystal. |
 | `pps_jitter` | sensor (µs) | RMS scatter of the pulses around the fitted model. |
 | `requests` | sensor | NTP requests served since boot. |
+| `strong_satellites` | sensor | How many tracked satellites are at or above `strong_signal_threshold` (default 35 dB-Hz). Often a better guide than the mean when choosing a spot: the mean is dragged down by marginal satellites, while this counts the ones actually carrying the fix. |
+| `hdop` | sensor | Horizontal dilution of precision, from GGA. Satellite geometry — the other half of fix quality. Below 2 is good, above 5 is poor. |
+| `rejected_pulses` | sensor | PPS edges seen but not used: line noise, or pulses arriving without a fix. |
+| `nmea_errors` | sensor | NMEA sentences that failed their checksum. A rising count means a marginal serial link, usually the wrong baud or a long unshielded wire. |
+| `pulse_age` | sensor (s) | Seconds since the last accepted pulse, so brief dropouts show up in history even when it re-locks before the next update. |
 | `synced` | binary sensor | On while serving stratum 1. |
 
 ## Diagnostics
@@ -124,13 +130,14 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 Every `update_interval` the component logs a status line at DEBUG:
 
 ```
-edges=61 accepted=60 nmea=122/0 bad ubx=9 utc_valid=YES fit=60/64 confirmed=57 residual=-0.8us jitter=1.2us sats=9 stack_free=2140
+edges=61 accepted=60 nmea=122/0 bad ubx=9 utc_valid=YES fit=60/64 confirmed=57 residual=-0.8us jitter=1.2us sats=9 cno=39.2 strong=6 hdop=0.9 stack_free=2140
 ```
 
 - `edges` / `accepted`: PPS edges seen, and pulses that went into the fit.
 - `nmea=ok/bad`: sentences with a good and a bad checksum. `ubx`: UBX frames received.
 - `confirmed`: RMC sentences that agreed with the pulse count since the last reset (3 are needed to serve).
-- `stack_free`: the NTP task's stack high-water mark, in bytes.
+- `cno` / `strong`: mean signal strength, and how many satellites are at or above `strong_signal_threshold`. `hdop`: satellite geometry.
+- `stack_free`: the NTP task's stack high-water mark in bytes, or `n/a` on the raw lwIP transport, which has no task of its own.
 
 At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports when no PPS edges or no valid NMEA arrived during the interval. Those are the two symptoms of a wiring fault, and nothing else would log them.
 
@@ -147,7 +154,7 @@ At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports wh
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.3.3
+  - source: github://davidcoulson/esphome-pps-ntp@v0.4.0
     components: [pps_ntp, gnss_sim]
 
 gnss_sim:

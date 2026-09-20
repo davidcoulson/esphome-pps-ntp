@@ -13,6 +13,8 @@ import esphome.config_validation as cv
 import esphome.final_validate as fv
 from esphome.const import (
     CONF_ID,
+    DEVICE_CLASS_DURATION,
+    UNIT_SECOND,
     CONF_PORT,
     CONF_SATELLITES,
     DEVICE_CLASS_CONNECTIVITY,
@@ -35,6 +37,12 @@ CONF_FREQUENCY_OFFSET = "frequency_offset"
 CONF_PPS_JITTER = "pps_jitter"
 CONF_REQUESTS = "requests"
 CONF_SIGNAL_STRENGTH = "signal_strength"
+CONF_STRONG_SATELLITES = "strong_satellites"
+CONF_STRONG_THRESHOLD = "strong_signal_threshold"
+CONF_HDOP = "hdop"
+CONF_REJECTED_PULSES = "rejected_pulses"
+CONF_NMEA_ERRORS = "nmea_errors"
+CONF_PULSE_AGE = "pulse_age"
 CONF_FIT_WINDOW = "fit_window"
 CONF_MAX_RESIDUAL = "max_residual"
 CONF_REFID = "refid"
@@ -121,6 +129,43 @@ CONFIG_SCHEMA = cv.All(
                 state_class=STATE_CLASS_MEASUREMENT,
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
             ),
+            # How strong a satellite has to be to count towards strong_satellites
+            cv.Optional(CONF_STRONG_THRESHOLD, default=35): cv.int_range(min=20, max=50),
+            cv.Optional(CONF_STRONG_SATELLITES): sensor.sensor_schema(
+                icon="mdi:satellite-uplink",
+                accuracy_decimals=0,
+                state_class=STATE_CLASS_MEASUREMENT,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
+            # Horizontal dilution of precision: satellite geometry, the other half of fix quality
+            cv.Optional(CONF_HDOP): sensor.sensor_schema(
+                icon="mdi:crosshairs-gps",
+                accuracy_decimals=2,
+                state_class=STATE_CLASS_MEASUREMENT,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
+            # PPS edges seen but not used: noise on the PPS line, or pulses arriving without a fix
+            cv.Optional(CONF_REJECTED_PULSES): sensor.sensor_schema(
+                icon="mdi:pulse",
+                accuracy_decimals=0,
+                state_class=STATE_CLASS_TOTAL_INCREASING,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
+            cv.Optional(CONF_NMEA_ERRORS): sensor.sensor_schema(
+                icon="mdi:alert-circle-outline",
+                accuracy_decimals=0,
+                state_class=STATE_CLASS_TOTAL_INCREASING,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
+            # Seconds since the last accepted pulse: makes brief dropouts visible in history
+            cv.Optional(CONF_PULSE_AGE): sensor.sensor_schema(
+                unit_of_measurement=UNIT_SECOND,
+                device_class=DEVICE_CLASS_DURATION,
+                icon="mdi:timer-outline",
+                accuracy_decimals=0,
+                state_class=STATE_CLASS_MEASUREMENT,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
             cv.Optional(CONF_FREQUENCY_OFFSET): sensor.sensor_schema(
                 unit_of_measurement=UNIT_PARTS_PER_MILLION,
                 icon="mdi:sine-wave",
@@ -203,6 +248,7 @@ async def to_code(config):
     cg.add(var.set_max_residual_us(config[CONF_MAX_RESIDUAL].total_microseconds))
     cg.add(var.set_refid(config[CONF_REFID]))
     cg.add(var.set_require_utc_valid(config[CONF_REQUIRE_UTC_VALID]))
+    cg.add(var.set_strong_threshold(config[CONF_STRONG_THRESHOLD]))
     if config[CONF_TRANSPORT] == TRANSPORT_RAW_LWIP:
         cg.add_define("USE_PPS_NTP_RAW_UDP")
     if CONF_TASK_CORE in config:
@@ -214,6 +260,11 @@ async def to_code(config):
     for key, setter in (
         (CONF_SATELLITES, "set_satellites_sensor"),
         (CONF_SIGNAL_STRENGTH, "set_signal_strength_sensor"),
+        (CONF_STRONG_SATELLITES, "set_strong_satellites_sensor"),
+        (CONF_HDOP, "set_hdop_sensor"),
+        (CONF_REJECTED_PULSES, "set_rejected_pulses_sensor"),
+        (CONF_NMEA_ERRORS, "set_nmea_errors_sensor"),
+        (CONF_PULSE_AGE, "set_pulse_age_sensor"),
         (CONF_FREQUENCY_OFFSET, "set_frequency_offset_sensor"),
         (CONF_PPS_JITTER, "set_pps_jitter_sensor"),
         (CONF_REQUESTS, "set_requests_sensor"),

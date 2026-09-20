@@ -49,6 +49,8 @@ disp = struct.unpack("!I", last[8:12])[0] / 65536 * 1e6
 refid = last[12:16].rstrip(b"\0").decode("ascii", "replace")
 print(f"{host}: LI={li} VN={vn} mode={mode} stratum={last[1]} precision=2^{prec} refid={refid} root_dispersion={disp:.0f}us")
 print(f"  server time: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ts(last[40:48])))} UTC, offset from this machine {statistics.median(offsets):+.3f} s")
+best = min(range(len(rtts)), key=lambda i: rtts[i])
+print(f"  offset at the lowest-delay sample (least path asymmetry): {offsets[best]*1000:+.2f} ms  [RTT {rtts[best]:.0f} us]")
 q = lambda v, p: sorted(v)[min(len(v) - 1, int(len(v) * p))]
 print(f"  replies {len(rtts)}/{count}  RTT us: min {min(rtts):.0f}  median {statistics.median(rtts):.0f}  p95 {q(rtts, .95):.0f}  max {max(rtts):.0f}")
 print(f"  server processing (tx-rx) us: min {min(procs):.0f}  median {statistics.median(procs):.0f}  p95 {q(procs, .95):.0f}  max {max(procs):.0f}")

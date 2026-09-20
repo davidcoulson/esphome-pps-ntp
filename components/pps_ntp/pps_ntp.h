@@ -61,6 +61,12 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
 
   void set_satellites_sensor(sensor::Sensor *s) { this->satellites_sensor_ = s; }
   void set_signal_strength_sensor(sensor::Sensor *s) { this->signal_strength_sensor_ = s; }
+  void set_strong_satellites_sensor(sensor::Sensor *s) { this->strong_satellites_sensor_ = s; }
+  void set_hdop_sensor(sensor::Sensor *s) { this->hdop_sensor_ = s; }
+  void set_rejected_pulses_sensor(sensor::Sensor *s) { this->rejected_pulses_sensor_ = s; }
+  void set_nmea_errors_sensor(sensor::Sensor *s) { this->nmea_errors_sensor_ = s; }
+  void set_pulse_age_sensor(sensor::Sensor *s) { this->pulse_age_sensor_ = s; }
+  void set_strong_threshold(int dbhz) { this->strong_threshold_ = dbhz; }
   void set_frequency_offset_sensor(sensor::Sensor *s) { this->frequency_offset_sensor_ = s; }
   void set_pps_jitter_sensor(sensor::Sensor *s) { this->pps_jitter_sensor_ = s; }
   void set_requests_sensor(sensor::Sensor *s) { this->requests_sensor_ = s; }
@@ -200,6 +206,13 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   uint32_t cno_sum_{0};
   uint16_t cno_count_{0};
   bool cno_saw_gsv_{false};
+  // Satellites at or above strong_threshold_: a better guide to antenna placement than the mean, which
+  // marginal satellites drag down
+  int strong_threshold_{35};
+  uint16_t strong_accum_{0};
+  int strong_satellites_{-1};
+  float hdop_{0};  // horizontal dilution of precision, from GGA: the geometry half of fix quality
+  bool hdop_valid_{false};
 
   // Baud switching for legacy u-blox modules
   enum class BaudState : uint8_t { OFF, PROBE, VERIFY, RETRY_WAIT, DONE };
@@ -211,6 +224,11 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
 
   sensor::Sensor *satellites_sensor_{nullptr};
   sensor::Sensor *signal_strength_sensor_{nullptr};
+  sensor::Sensor *strong_satellites_sensor_{nullptr};
+  sensor::Sensor *hdop_sensor_{nullptr};
+  sensor::Sensor *rejected_pulses_sensor_{nullptr};
+  sensor::Sensor *nmea_errors_sensor_{nullptr};
+  sensor::Sensor *pulse_age_sensor_{nullptr};
   sensor::Sensor *frequency_offset_sensor_{nullptr};
   sensor::Sensor *pps_jitter_sensor_{nullptr};
   sensor::Sensor *requests_sensor_{nullptr};

@@ -4,6 +4,11 @@ Hardware status: run on an ESP32-S3-ETH against the `gnss_sim` emulator. Not yet
 
 ## Unreleased
 
+## v0.4.0 - 2026-09-20
+- New sensors: `strong_satellites` (with `strong_signal_threshold`), `hdop`, `rejected_pulses`, `nmea_errors` and `pulse_age`.
+- The status line reports `strong` and `hdop`, and `stack_free` prints `n/a` on the raw lwIP transport instead of 0.
+- First run against a real receiver (u-blox on an ESP32-S3-ETH): 420/420 pulses accepted, 0 NMEA checksum errors, PPS jitter 0.5-0.8 us, crystal offset steady to 0.15 ppm.
+
 ## v0.3.3 - 2026-09-19
 - New `signal_strength` sensor: mean C/N0 of the tracked satellites, parsed from GSV. Intended for comparing antenna positions.
 - CI: host simulation, config validation (including a config that must be rejected), and compiles for ESP32-S3 (ESP-IDF default and 6.1.0), S3 with raw lwIP + IPv6 + `gnss_sim`, ESP32-C3 and ESP32-P4.

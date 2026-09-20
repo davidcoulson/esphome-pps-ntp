@@ -40,6 +40,12 @@ pps_ntp:
   require_utc_valid: true
   satellites: {name: Satellites}
   signal_strength: {name: Signal Strength}
+  strong_signal_threshold: 38
+  strong_satellites: {name: Strong Satellites}
+  hdop: {name: HDOP}
+  rejected_pulses: {name: Rejected Pulses}
+  nmea_errors: {name: NMEA Errors}
+  pulse_age: {name: Pulse Age}
   frequency_offset: {name: Crystal Offset}
   pps_jitter: {name: PPS Jitter}
   requests: {name: NTP Requests}

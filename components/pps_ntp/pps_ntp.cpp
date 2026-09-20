@@ -308,6 +308,17 @@ void PPSNTPServer::update() {
     this->satellites_sensor_->publish_state(this->satellites_);
   if (this->signal_strength_sensor_ != nullptr && this->cno_valid_)
     this->signal_strength_sensor_->publish_state(this->cno_mean_);
+  if (this->strong_satellites_sensor_ != nullptr && this->strong_satellites_ >= 0)
+    this->strong_satellites_sensor_->publish_state(this->strong_satellites_);
+  if (this->hdop_sensor_ != nullptr && this->hdop_valid_)
+    this->hdop_sensor_->publish_state(this->hdop_);
+  if (this->rejected_pulses_sensor_ != nullptr)
+    this->rejected_pulses_sensor_->publish_state(this->edges_seen_ - this->pulses_accepted_);
+  if (this->nmea_errors_sensor_ != nullptr)
+    this->nmea_errors_sensor_->publish_state(this->nmea_bad_);
+  if (this->pulse_age_sensor_ != nullptr && model.valid) {
+    this->pulse_age_sensor_->publish_state((esp_timer_get_time() - model.last_pulse_local_us) / 1e6);
+  }
   if (this->frequency_offset_sensor_ != nullptr && model.valid)
     this->frequency_offset_sensor_->publish_state(model.local_us_per_s - 1e6);
   if (this->pps_jitter_sensor_ != nullptr && model.valid)
@@ -332,15 +343,20 @@ void PPSNTPServer::log_status_() {
   this->status_edges_ = this->edges_seen_;
   this->status_nmea_ = this->nmea_ok_;
 
-  unsigned stack_free = this->task_ != nullptr ? uxTaskGetStackHighWaterMark(this->task_) : 0;
+  char stack_free[12];
+  if (this->task_ != nullptr) {
+    snprintf(stack_free, sizeof(stack_free), "%u", static_cast<unsigned>(uxTaskGetStackHighWaterMark(this->task_)));
+  } else {
+    strcpy(stack_free, "n/a");  // the raw lwIP transport runs in the tcpip thread, with no task of ours
+  }
   ESP_LOGD(TAG,
            "edges=%u accepted=%u nmea=%u/%u bad ubx=%u utc_valid=%s fit=%d/%d confirmed=%u residual=%.1fus "
-           "jitter=%.1fus sats=%d cno=%.1f stack_free=%u",
+           "jitter=%.1fus sats=%d cno=%.1f strong=%d hdop=%.1f stack_free=%s",
            static_cast<unsigned>(this->edges_seen_), static_cast<unsigned>(this->pulses_accepted_),
            static_cast<unsigned>(this->nmea_ok_), static_cast<unsigned>(this->nmea_bad_),
            static_cast<unsigned>(this->ubx_frames_), YESNO(this->utc_trusted_), this->hist_count_, this->fit_window_,
            static_cast<unsigned>(this->label_confirmations_), this->last_residual_us_, std::sqrt(this->jitter_sq_us_),
-           this->satellites_, this->cno_mean_, stack_free);
+           this->satellites_, this->cno_mean_, this->strong_satellites_, this->hdop_, stack_free);
 }
 
 void PPSNTPServer::dump_config() {
@@ -360,10 +376,11 @@ void PPSNTPServer::dump_config() {
                 "  Holdover: %us\n"
                 "  Fit window: %d pulses\n"
                 "  Max residual: %.0f µs\n"
+                "  Strong signal threshold: %d dB-Hz\n"
                 "  Refid: %.4s\n"
                 "  Require UTC valid: %s",
                 this->port_, static_cast<unsigned>(this->holdover_us_ / 1000000), this->fit_window_,
-                this->max_residual_us_, this->refid_, YESNO(this->require_utc_valid_));
+                this->max_residual_us_, this->strong_threshold_, this->refid_, YESNO(this->require_utc_valid_));
 #ifdef USE_PPS_NTP_RAW_UDP
   ESP_LOGCONFIG(TAG, "  Transport: raw lwIP (experimental)");
 #else
@@ -379,6 +396,11 @@ void PPSNTPServer::dump_config() {
   LOG_UPDATE_INTERVAL(this);
   LOG_SENSOR("  ", "Satellites", this->satellites_sensor_);
   LOG_SENSOR("  ", "Signal Strength", this->signal_strength_sensor_);
+  LOG_SENSOR("  ", "Strong Satellites", this->strong_satellites_sensor_);
+  LOG_SENSOR("  ", "HDOP", this->hdop_sensor_);
+  LOG_SENSOR("  ", "Rejected Pulses", this->rejected_pulses_sensor_);
+  LOG_SENSOR("  ", "NMEA Errors", this->nmea_errors_sensor_);
+  LOG_SENSOR("  ", "Pulse Age", this->pulse_age_sensor_);
   LOG_SENSOR("  ", "Frequency Offset", this->frequency_offset_sensor_);
   LOG_SENSOR("  ", "PPS Jitter", this->pps_jitter_sensor_);
   LOG_SENSOR("  ", "Requests", this->requests_sensor_);
@@ -635,8 +657,13 @@ void PPSNTPServer::handle_nmea_(char *line) {
     // RMC opens each epoch's burst, so the GSV sentences accumulated since the last one are complete
     this->finalize_cno_();
     this->handle_rmc_(fields, count);
-  } else if (strcmp(type, "GGA") == 0 && count > 7 && fields[7][0] != '\0') {
-    this->satellites_ = atoi(fields[7]);
+  } else if (strcmp(type, "GGA") == 0) {
+    if (count > 7 && fields[7][0] != '\0')
+      this->satellites_ = atoi(fields[7]);
+    if (count > 8 && fields[8][0] != '\0') {
+      this->hdop_ = atof(fields[8]);
+      this->hdop_valid_ = true;
+    }
   } else if (strcmp(type, "GSV") == 0) {
     this->handle_gsv_(fields, count);
   }
@@ -738,6 +765,8 @@ void PPSNTPServer::handle_gsv_(char **fields, int count) {
       continue;
     this->cno_sum_ += cno;
     this->cno_count_++;
+    if (cno >= this->strong_threshold_)
+      this->strong_accum_++;
   }
 }
 
@@ -746,9 +775,11 @@ void PPSNTPServer::finalize_cno_() {
   if (this->cno_saw_gsv_) {
     this->cno_mean_ = this->cno_count_ > 0 ? static_cast<float>(this->cno_sum_) / this->cno_count_ : 0.0f;
     this->cno_valid_ = true;
+    this->strong_satellites_ = this->strong_accum_;
   }
   this->cno_sum_ = 0;
   this->cno_count_ = 0;
+  this->strong_accum_ = 0;
   this->cno_saw_gsv_ = false;
 }
 

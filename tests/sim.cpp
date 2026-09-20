@@ -23,7 +23,7 @@ struct Sim : PPSNTPServer {
   uart::UARTComponent uart;
   InternalGPIOPin pin;
   sensor::Sensor sats;
-  sensor::Sensor cno;
+  sensor::Sensor cno, strong, hdop, rejected, nmea_err, pulse_age;
   bool tracking = true;  // false: satellites in view but none tracked (e.g. antenna unplugged)
   std::mt19937 rng{42};
 
@@ -56,6 +56,11 @@ struct Sim : PPSNTPServer {
     this->set_pps_pin(&pin);
     this->set_satellites_sensor(&sats);
     this->set_signal_strength_sensor(&cno);
+    this->set_strong_satellites_sensor(&strong);
+    this->set_hdop_sensor(&hdop);
+    this->set_rejected_pulses_sensor(&rejected);
+    this->set_nmea_errors_sensor(&nmea_err);
+    this->set_pulse_age_sensor(&pulse_age);
   }
 
   static std::string nmea(const std::string &body) {
@@ -236,6 +241,9 @@ int main(int argc, char **argv) {
     s.run(200);
     check(s.silent == silent_before, "never goes silent once synced (no discipline reset)");
     check(std::fabs(s.worst_served_error_us) < 50, "served time within 50 us of truth");
+    s.update();
+    check(s.rejected.state > 20, "rejected-pulse counter recorded the glitches");
+    check(s.nmea_err.state == 0, "no NMEA checksum errors");
   }
 
   begin("D. Loop stalls 1.2 s right at the first label and loses a sentence (#2)");
@@ -341,8 +349,12 @@ int main(int argc, char **argv) {
     Sim s; s.setup(); s.run(20); s.update();
     printf("    reported %.2f dB-Hz (expected 34.67)\n", s.cno.state);
     check(std::fabs(s.cno.state - 208.0 / 6.0) < 0.01, "mean over tracked satellites, ignoring untracked");
+    check(s.strong.state == 3, "3 satellites at or above the 35 dB-Hz threshold (45, 38, 41)");
+    check(std::fabs(s.hdop.state - 0.9) < 0.001, "HDOP from GGA");
+    check(s.pulse_age.state < 2, "pulse age is seconds, not minutes");
     s.tracking = false; s.run(5); s.update();
     check(s.cno.state == 0.0f, "reads 0 when nothing is tracked");
+    check(s.strong.state == 0, "no strong satellites either");
     s.tracking = true; s.run(5); s.update();
     check(std::fabs(s.cno.state - 208.0 / 6.0) < 0.01, "recovers");
   }
