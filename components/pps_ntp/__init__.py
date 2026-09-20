@@ -48,6 +48,8 @@ CONF_MAX_RESIDUAL = "max_residual"
 CONF_REFID = "refid"
 CONF_TASK_CORE = "task_core"
 CONF_REQUIRE_UTC_VALID = "require_utc_valid"
+CONF_STATIONARY = "stationary"
+CONF_TRIM_NMEA = "trim_nmea"
 CONF_TRANSPORT = "transport"
 TRANSPORT_SOCKET = "socket"
 TRANSPORT_RAW_LWIP = "raw_lwip"
@@ -103,6 +105,10 @@ CONFIG_SCHEMA = cv.All(
             # Never serve until the receiver confirms UTC over UBX. Without this, a receiver that doesn't
             # answer UBX is trusted after 60 s, which can be a leap-second count off for ~12.5 min from cold
             cv.Optional(CONF_REQUIRE_UTC_VALID, default=False): cv.boolean,
+            # Tell the receiver it is in a fixed installation (UBX-CFG-NAV5 stationary model)
+            cv.Optional(CONF_STATIONARY, default=True): cv.boolean,
+            # Silence the NMEA sentences this component doesn't read, keeping RMC, GGA and GSV
+            cv.Optional(CONF_TRIM_NMEA, default=False): cv.boolean,
             # EXPERIMENTAL raw_lwip: answer from lwIP's tcpip thread instead of a socket task
             cv.Optional(CONF_TRANSPORT, default=TRANSPORT_SOCKET): cv.one_of(
                 TRANSPORT_SOCKET, TRANSPORT_RAW_LWIP, lower=True
@@ -249,6 +255,8 @@ async def to_code(config):
     cg.add(var.set_refid(config[CONF_REFID]))
     cg.add(var.set_require_utc_valid(config[CONF_REQUIRE_UTC_VALID]))
     cg.add(var.set_strong_threshold(config[CONF_STRONG_THRESHOLD]))
+    cg.add(var.set_stationary(config[CONF_STATIONARY]))
+    cg.add(var.set_trim_nmea(config[CONF_TRIM_NMEA]))
     if config[CONF_TRANSPORT] == TRANSPORT_RAW_LWIP:
         cg.add_define("USE_PPS_NTP_RAW_UDP")
     if CONF_TASK_CORE in config:

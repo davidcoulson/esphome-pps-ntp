@@ -153,6 +153,11 @@ void PPSNTPServer::loop() {
 
   this->service_baud_switch_();
 
+  // Once the link is settled and sentences are arriving, set the receiver up for a fixed installation
+  if (!this->receiver_configured_ && this->nmea_ok_ > 0 &&
+      (this->baud_state_ == BaudState::OFF || this->baud_state_ == BaudState::DONE))
+    this->configure_receiver_();
+
   uint32_t now_ms = millis();
   // Poll quickly until UTC is confirmed, so a warm receiver isn't held at stratum 16 for a full interval
   if (now_ms - this->last_ubx_poll_ms_ >= (this->utc_trusted_ ? UBX_POLL_INTERVAL_MS : UBX_POLL_FAST_MS)) {
@@ -377,10 +382,13 @@ void PPSNTPServer::dump_config() {
                 "  Fit window: %d pulses\n"
                 "  Max residual: %.0f µs\n"
                 "  Strong signal threshold: %d dB-Hz\n"
+                "  Stationary model: %s\n"
+                "  Trim NMEA output: %s\n"
                 "  Refid: %.4s\n"
                 "  Require UTC valid: %s",
                 this->port_, static_cast<unsigned>(this->holdover_us_ / 1000000), this->fit_window_,
-                this->max_residual_us_, this->strong_threshold_, this->refid_, YESNO(this->require_utc_valid_));
+                this->max_residual_us_, this->strong_threshold_, YESNO(this->stationary_),
+                YESNO(this->trim_nmea_), this->refid_, YESNO(this->require_utc_valid_));
 #ifdef USE_PPS_NTP_RAW_UDP
   ESP_LOGCONFIG(TAG, "  Transport: raw lwIP (experimental)");
 #else
@@ -783,9 +791,41 @@ void PPSNTPServer::finalize_cno_() {
   this->cno_saw_gsv_ = false;
 }
 
+// UBX-CFG-GNSS: which constellations the receiver has and which are switched on. Reported once so the
+// installer can see whether, for example, GLONASS is available to add alongside GPS.
+void PPSNTPServer::handle_cfg_gnss_(const uint8_t *payload, uint16_t len) {
+  if (len < 4)
+    return;
+  uint8_t blocks = payload[3];
+  if (len < 4u + blocks * 8u)
+    return;
+  static const char *const NAMES[] = {"GPS", "SBAS", "Galileo", "BeiDou", "IMES", "QZSS", "GLONASS", "NavIC"};
+  char list[160];
+  size_t pos = 0;
+  for (uint8_t i = 0; i < blocks; i++) {
+    const uint8_t *block = payload + 4 + i * 8;
+    uint8_t id = block[0];
+    const char *name = id < sizeof(NAMES) / sizeof(NAMES[0]) ? NAMES[id] : "?";
+    int written = snprintf(list + pos, sizeof(list) - pos, "%s%s(%s, max %u ch)", pos > 0 ? ", " : "", name,
+                           (block[4] & 0x01) ? "on" : "off", block[2]);
+    if (written < 0 || pos + written >= sizeof(list))
+      break;
+    pos += written;
+  }
+  ESP_LOGI(TAG, "Receiver constellations: %s; %u hardware tracking channels", list, payload[1]);
+}
+
 void PPSNTPServer::handle_ubx_(uint8_t msg_class, uint8_t msg_id, const uint8_t *payload, uint16_t len) {
   this->ubx_seen_ = true;
   this->ubx_frames_++;
+  if (msg_class == 0x05 && msg_id == 0x00 && len >= 2) {  // UBX-ACK-NAK
+    ESP_LOGW(TAG, "Receiver rejected UBX command 0x%02X 0x%02X", payload[0], payload[1]);
+    return;
+  }
+  if (msg_class == 0x06 && msg_id == 0x3E) {
+    this->handle_cfg_gnss_(payload, len);
+    return;
+  }
   if (msg_class == 0x01 && msg_id == 0x26 && len >= 24) {  // NAV-TIMELS
     int8_t change = static_cast<int8_t>(payload[11]);
     int32_t to_event = static_cast<int32_t>(payload[12] | (payload[13] << 8) | (payload[14] << 16) |
@@ -830,6 +870,41 @@ void PPSNTPServer::send_ubx_(uint8_t msg_class, uint8_t msg_id, const uint8_t *p
     this->write_array(payload, len);
   this->write_array(checksum, sizeof(checksum));
   this->flush();
+}
+
+// Applied once per boot, after the baud rate has settled. These are RAM-only settings: they are not
+// saved to the receiver, so a receiver power cycle reverts them and our next boot re-applies them.
+void PPSNTPServer::configure_receiver_() {
+  this->receiver_configured_ = true;
+
+  if (this->stationary_) {
+    // UBX-CFG-NAV5 with only the dynamic-model bit set, model 2 = stationary. A receiver that knows it
+    // cannot be moving constrains its solution, which steadies the time when signals are marginal.
+    uint8_t cfg_nav5[36] = {0};
+    cfg_nav5[0] = 0x01;  // mask: apply dynModel
+    cfg_nav5[2] = 0x02;  // dynModel: stationary
+    this->send_ubx_(0x06, 0x24, cfg_nav5, sizeof(cfg_nav5));
+    ESP_LOGI(TAG, "Set the receiver to the stationary dynamic model");
+  }
+
+  if (this->trim_nmea_) {
+    // Legacy UBX-CFG-MSG, 3-byte form: set one NMEA message's rate on the port it arrives on
+    static constexpr uint8_t NMEA_CLASS = 0xF0;
+    static constexpr uint8_t KEEP[] = {0x04, 0x00, 0x03};  // RMC (time), GGA (satellites, HDOP), GSV (C/N0)
+    static constexpr uint8_t DROP[] = {0x01, 0x02, 0x05, 0x06,
+                                       0x07, 0x08, 0x09, 0x0A};  // GLL GSA VTG GRS GST ZDA GBS DTM
+    for (uint8_t id : KEEP) {
+      uint8_t payload[3] = {NMEA_CLASS, id, 1};
+      this->send_ubx_(0x06, 0x01, payload, sizeof(payload));
+    }
+    for (uint8_t id : DROP) {
+      uint8_t payload[3] = {NMEA_CLASS, id, 0};
+      this->send_ubx_(0x06, 0x01, payload, sizeof(payload));
+    }
+    ESP_LOGI(TAG, "Trimmed the receiver's NMEA output to RMC, GGA and GSV");
+  }
+
+  this->send_ubx_(0x06, 0x3E, nullptr, 0);  // poll CFG-GNSS, to report which constellations exist
 }
 
 // Older u-blox receivers only accept the legacy UBX-CFG-PRT message for port settings

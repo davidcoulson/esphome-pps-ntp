@@ -67,6 +67,8 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void set_nmea_errors_sensor(sensor::Sensor *s) { this->nmea_errors_sensor_ = s; }
   void set_pulse_age_sensor(sensor::Sensor *s) { this->pulse_age_sensor_ = s; }
   void set_strong_threshold(int dbhz) { this->strong_threshold_ = dbhz; }
+  void set_stationary(bool on) { this->stationary_ = on; }
+  void set_trim_nmea(bool on) { this->trim_nmea_ = on; }
   void set_frequency_offset_sensor(sensor::Sensor *s) { this->frequency_offset_sensor_ = s; }
   void set_pps_jitter_sensor(sensor::Sensor *s) { this->pps_jitter_sensor_ = s; }
   void set_requests_sensor(sensor::Sensor *s) { this->requests_sensor_ = s; }
@@ -98,6 +100,8 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void handle_gsv_(char **fields, int count);
   void finalize_cno_();
   void handle_ubx_(uint8_t msg_class, uint8_t msg_id, const uint8_t *payload, uint16_t len);
+  void handle_cfg_gnss_(const uint8_t *payload, uint16_t len);
+  void configure_receiver_();
   void send_ubx_(uint8_t msg_class, uint8_t msg_id, const uint8_t *payload, uint16_t len);
   void start_baud_switch_();
   void service_baud_switch_();
@@ -182,6 +186,9 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   }
   void fill_leap_(ClockModel &model) const;
   bool require_utc_valid_{false};
+  bool stationary_{true};   // tell the receiver it isn't moving (UBX-CFG-NAV5)
+  bool trim_nmea_{false};   // silence the sentences we don't read (UBX-CFG-MSG)
+  bool receiver_configured_{false};
   bool ubx_absent_warned_{false};
   bool server_started_{false};
   uint32_t boot_ms_{0};

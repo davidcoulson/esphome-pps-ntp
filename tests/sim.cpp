@@ -132,6 +132,17 @@ struct Sim : PPSNTPServer {
         p[12] = to_event & 0xFF; p[13] = (to_event >> 8) & 0xFF; p[14] = (to_event >> 16) & 0xFF; p[15] = (to_event >> 24) & 0xFF;
         p[23] = 0x03;
         rx_raw(ubx(0x01, 0x26, p));
+      } else if (heard && cls == 0x06 && id == 0x3E && len == 0) {
+        // CFG-GNSS poll: a NEO-7M-like answer, GLONASS present but switched off
+        std::vector<uint8_t> p = {0x00, 22, 22, 4};
+        auto block = [&](uint8_t gnss_id, uint8_t max_ch, bool on) {
+          p.insert(p.end(), {gnss_id, 8, max_ch, 0, static_cast<uint8_t>(on ? 1 : 0), 0, 0, 0});
+        };
+        block(0, 16, true); block(1, 3, true); block(5, 3, true); block(6, 14, false);
+        rx_raw(ubx(0x06, 0x3E, p));
+      } else if (heard && (cls == 0x06 && (id == 0x24 || id == 0x01))) {
+        std::vector<uint8_t> ack = {cls, id};
+        rx_raw(ubx(0x05, 0x01, ack));
       } else if (heard && cls == 0x06 && id == 0x00 && module_accepts_cfg_prt) {
         module_baud = tx[tx_seen + 6 + 8] | (tx[tx_seen + 6 + 9] << 8) | (tx[tx_seen + 6 + 10] << 16) | (tx[tx_seen + 6 + 11] << 24);
       }
@@ -357,6 +368,23 @@ int main(int argc, char **argv) {
     check(s.strong.state == 0, "no strong satellites either");
     s.tracking = true; s.run(5); s.update();
     check(std::fabs(s.cno.state - 208.0 / 6.0) < 0.01, "recovers");
+  }
+
+  begin("O. Receiver configuration (stationary model, NMEA trim, constellation report)");
+  {
+    Sim a; a.setup(); a.run(20);
+    check(a.count_tx(0x06, 0x24) == 1, "CFG-NAV5 stationary sent exactly once");
+    check(a.count_tx(0x06, 0x3E) == 1, "CFG-GNSS polled once");
+    check(a.count_tx(0x06, 0x01) == 0, "no NMEA trim by default");
+    a.run(120);
+    check(a.count_tx(0x06, 0x24) == 1, "still only once after two minutes");
+    check(a.served > 0, "still serving");
+
+    Sim b; b.set_trim_nmea(true); b.setup(); b.run(20);
+    check(b.count_tx(0x06, 0x01) == 11, "trim_nmea sent 11 CFG-MSG frames (3 kept, 8 dropped)");
+
+    Sim c; c.set_stationary(false); c.setup(); c.run(20);
+    check(c.count_tx(0x06, 0x24) == 0, "stationary: false sends no CFG-NAV5");
   }
 
   printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED", failures, failures == 1 ? "" : "s");
