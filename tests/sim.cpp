@@ -20,6 +20,7 @@ static const double PPM = 23.0;        // crystal runs fast
 static const int64_t L0 = 1200000;     // local time of the first pulse (a powered receiver is already talking at boot)
 
 struct Sim : PPSNTPServer {
+  friend int main(int, char **);
   uart::UARTComponent uart;
   InternalGPIOPin pin;
   sensor::Sensor sats;
@@ -167,7 +168,7 @@ struct Sim : PPSNTPServer {
 
   void query(bool check) {
     uint8_t req[48] = {0x23}, rep[48];
-    if (!this->build_reply_(req, g_now_us, rep)) { silent++; return; }
+    if (!this->build_reply_(req, g_now_us, 0, rep)) { silent++; return; }
     if (rep[1] != 1) { unsynced++; return; }
     li_seen[rep[0] >> 6]++;
     served++;
@@ -389,6 +390,98 @@ int main(int argc, char **argv) {
 
     Sim c; c.set_stationary(false); c.setup(); c.run(20);
     check(c.count_tx(0x06, 0x24) == 0, "stationary: false sends no CFG-NAV5");
+  }
+
+  begin("P. Driver-level receive stamps (frame parsing, lookup, fallback)");
+  {
+    // Ethernet + IPv4 + UDP + NTP client request from port 50123 to 123
+    uint8_t f[14 + 20 + 8 + 48] = {};
+    f[12] = 0x08; f[13] = 0x00;
+    uint8_t *ip = f + 14; ip[0] = 0x45; ip[9] = 17;
+    uint8_t *udp = ip + 20; udp[0] = 50123 >> 8; udp[1] = 50123 & 0xFF; udp[2] = 0; udp[3] = 123;
+    uint8_t *ntp = udp + 8; ntp[0] = 0x23;
+    for (int i = 0; i < 8; i++) ntp[40 + i] = 0xA0 + i;
+    uint8_t key[RX_KEY_LEN];
+    check(parse_ntp_request_frame(f, sizeof(f), 123, key) && key[0] == 0xA0 && key[7] == 0xA7 &&
+              key[8] == (50123 >> 8) && key[9] == (50123 & 0xFF), "IPv4 request parsed, key = transmit ts + src port");
+    check(!parse_ntp_request_frame(f, sizeof(f), 124, key), "other destination port ignored");
+    check(!parse_ntp_request_frame(f, sizeof(f) - 1, 123, key), "truncated frame ignored");
+    ntp[0] = 0x24;
+    check(!parse_ntp_request_frame(f, sizeof(f), 123, key), "server-mode packet ignored");
+    ntp[0] = 0x23; ip[6] = 0x20;  // MF
+    check(!parse_ntp_request_frame(f, sizeof(f), 123, key), "IPv4 fragment ignored");
+    ip[6] = 0x40;  // DF is fine
+    check(parse_ntp_request_frame(f, sizeof(f), 123, key), "DF set still parsed");
+
+    uint8_t v[14 + 40 + 8 + 48] = {};
+    v[12] = 0x86; v[13] = 0xDD; v[14] = 0x60; v[14 + 6] = 17;
+    uint8_t *vu = v + 54; vu[1] = 77; vu[3] = 123; vu[8] = 0x23; vu[8 + 40] = 0x55;
+    check(parse_ntp_request_frame(v, sizeof(v), 123, key) && key[0] == 0x55 && key[9] == 77, "IPv6 request parsed");
+    v[14 + 6] = 0;  // hop-by-hop extension header
+    check(!parse_ntp_request_frame(v, sizeof(v), 123, key), "IPv6 with extension headers ignored");
+
+    uint8_t t[4 + sizeof(f)] = {};
+    memcpy(t, f, 12); t[12] = 0x81; t[13] = 0x00; memcpy(t + 16, f + 12, sizeof(f) - 12);
+    check(parse_ntp_request_frame(t, sizeof(t), 123, key), "802.1Q-tagged frame parsed");
+
+    Sim s; s.setup(); s.run(30);
+    check(s.served > 0, "synced");
+    uint8_t req[48] = {0x23}, rep[48];
+    for (int i = 0; i < 8; i++) req[40 + i] = 0x10 + i;
+    uint8_t k[RX_KEY_LEN]; memcpy(k, req + 40, 8); k[8] = 0x12; k[9] = 0x34;
+    auto t2_us = [&](const uint8_t *r) {
+      uint32_t sec = (r[32] << 24) | (r[33] << 16) | (r[34] << 8) | r[35];
+      uint32_t frac = (r[36] << 24) | (r[37] << 16) | (r[38] << 8) | r[39];
+      return (static_cast<long double>(sec) - 2208988800.0L) * 1e6L + frac * 1e6L / 4294967296.0L;
+    };
+    s.build_reply_(req, g_now_us, 0x1234, rep);
+    long double stack_t2 = t2_us(rep);
+    s.rx_hook_active_ = true;
+    s.rx_record_(k, g_now_us - 700);
+    s.build_reply_(req, g_now_us, 0x1234, rep);
+    long double hook_t2 = t2_us(rep);
+    printf("    stack T2 - hook T2 = %.1f us\n", static_cast<double>(stack_t2 - hook_t2));
+    check(std::fabs(static_cast<double>(stack_t2 - hook_t2) - 700) < 2, "T2 taken from the driver stamp");
+    check(s.rx_hook_hits_ == 1 && s.rx_gain_count_ == 1 && s.rx_gain_sum_us_ == 700, "gain recorded");
+    s.set_driver_rx_timestamp(false);
+    s.build_reply_(req, g_now_us, 0x1234, rep);
+    check(std::fabs(static_cast<double>(t2_us(rep) - stack_t2)) < 2, "switch off: stack stamp used, gain still measured");
+    check(s.rx_gain_count_ == 2, "second gain sample");
+    s.set_driver_rx_timestamp(true);
+    s.build_reply_(req, g_now_us, 0x1235, rep);
+    check(std::fabs(static_cast<double>(t2_us(rep) - stack_t2)) < 2 && s.rx_hook_misses_ == 1,
+          "different source port: no match, falls back to the stack stamp");
+    s.run(1);  // the stamp is now a second old
+    uint32_t hits = s.rx_hook_hits_;
+    s.build_reply_(req, g_now_us, 0x1234, rep);
+    check(s.rx_hook_hits_ == hits, "stale stamp not used");
+    for (int i = 0; i < 20; i++) { uint8_t other[RX_KEY_LEN] = {static_cast<uint8_t>(i)}; s.rx_record_(other, g_now_us); }
+    check(s.rx_ring_[0].seq.load() % 2 == 0, "ring slots settle on even sequence numbers");
+
+    check(static_cast<int8_t>(rep[3]) == -19, "precision measured from the clock (1 us step = 2^-19 s)");
+    uint32_t disp = (rep[8] << 24) | (rep[9] << 16) | (rep[10] << 8) | rep[11];
+    check(disp >= 16 && disp <= 17, "root dispersion defaults to 250 us (+ drift since the last pulse)");
+    Sim d; d.set_root_dispersion_us(1000); d.setup(); d.run(30);
+    d.build_reply_(req, g_now_us, 0, rep);
+    disp = (rep[8] << 24) | (rep[9] << 16) | (rep[10] << 8) | rep[11];
+    check(disp >= 65 && disp <= 66, "root dispersion configurable");
+  }
+
+  begin("Q. ARP priming client table");
+  {
+    Sim s; s.setup();
+    for (uint32_t i = 1; i <= 8; i++) { s.note_client_ipv4_(i); g_now_us += 1000000; s.run(0); }
+    s.note_client_ipv4_(3);  // refresh an existing client
+    int n = 0; for (auto &c : s.arp_clients_) n += c.load() != 0;
+    check(n == 8, "eight clients held");
+    s.run(1);
+    s.note_client_ipv4_(99);
+    bool has99 = false, has1 = false, has3 = false;
+    for (auto &c : s.arp_clients_) { has99 |= c == 99; has1 |= c == 1; has3 |= c == 3; }
+    check(has99 && !has1 && has3, "a ninth client replaces the least recently heard, not a recent one");
+    s.note_client_ipv4_(0);
+    n = 0; for (auto &c : s.arp_clients_) n += c.load() != 0;
+    check(n == 8, "address 0 ignored");
   }
 
   printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED", failures, failures == 1 ? "" : "s");

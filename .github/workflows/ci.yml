@@ -43,6 +43,12 @@ jobs:
             echo "expected a validation error"; exit 1
           fi
           grep -q "task_core needs a dual-core chip" out.txt
+      - name: rx_reference_pin without MCPWM is rejected
+        run: |
+          if esphome config tests/ci/invalid-rx-reference-c3.yaml > out.txt 2>&1; then
+            echo "expected a validation error"; exit 1
+          fi
+          grep -q "rx_reference_pin needs MCPWM hardware capture" out.txt
 
   compile:
     name: Compile ${{ matrix.config }}

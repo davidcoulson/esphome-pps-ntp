@@ -52,3 +52,9 @@ pps_ntp:
   pps_jitter: {name: PPS Jitter}
   requests: {name: NTP Requests}
   synced: {name: GPS Synced}
+  driver_rx_timestamp: true
+  root_dispersion: 400us
+  rx_reference_pin: 10
+  rx_timestamp_gain: {name: Rx Timestamp Gain}
+  rx_interrupt_lead: {name: Rx Interrupt Lead}
+  arp_clients: {name: ARP Clients}

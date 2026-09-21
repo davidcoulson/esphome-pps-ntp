@@ -19,6 +19,11 @@
 #include <driver/mcpwm_cap.h>
 #endif
 
+#ifdef USE_ETHERNET
+#include <esp_eth_driver.h>
+#include <esp_netif.h>
+#endif
+
 #ifdef USE_PPS_NTP_RAW_UDP
 struct udp_pcb;
 struct pbuf;
@@ -26,6 +31,15 @@ struct pbuf;
 #endif
 
 namespace esphome::pps_ntp {
+
+/// Length of the key that ties a driver-level receive stamp to the request it belongs to: the client's
+/// transmit timestamp (8 bytes, echoed in the request) followed by its UDP source port (big-endian).
+static constexpr int RX_KEY_LEN = 10;
+
+/// Parses a raw Ethernet frame. Returns true when it is an NTP client request (mode 3) to `port`, over
+/// IPv4 (unfragmented) or IPv6 (no extension headers), and fills `key`. Pure function: no platform
+/// calls, so the host tests can exercise it directly.
+bool parse_ntp_request_frame(const uint8_t *frame, uint32_t length, uint16_t port, uint8_t *key);
 
 // Maps the local esp_timer clock (µs since boot) onto UTC, re-fitted on every accepted PPS pulse
 struct ClockModel {
@@ -68,6 +82,15 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void set_pulse_age_sensor(sensor::Sensor *s) { this->pulse_age_sensor_ = s; }
   void set_strong_threshold(int dbhz) { this->strong_threshold_ = dbhz; }
   void set_stationary(bool on) { this->stationary_ = on; }
+  /// Runtime switch for A/B measurement: false makes replies use the stack-level T2 stamp even when the
+  /// driver hook is installed. Safe to call from a template switch at any time.
+  void set_driver_rx_timestamp(bool on) { this->driver_rx_timestamp_.store(on, std::memory_order_relaxed); }
+  void set_install_rx_hook(bool on) { this->install_rx_hook_requested_ = on; }
+  void set_root_dispersion_us(double us) { this->root_dispersion_us_ = us; }
+  void set_rx_reference_pin(int pin) { this->rx_reference_pin_ = pin; }
+  void set_rx_timestamp_gain_sensor(sensor::Sensor *s) { this->rx_timestamp_gain_sensor_ = s; }
+  void set_rx_interrupt_lead_sensor(sensor::Sensor *s) { this->rx_interrupt_lead_sensor_ = s; }
+  void set_arp_clients_sensor(sensor::Sensor *s) { this->arp_clients_sensor_ = s; }
   void set_trim_nmea(bool on) { this->trim_nmea_ = on; }
   void set_frequency_offset_sensor(sensor::Sensor *s) { this->frequency_offset_sensor_ = s; }
   void set_pps_jitter_sensor(sensor::Sensor *s) { this->pps_jitter_sensor_ = s; }
@@ -80,7 +103,60 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void ntp_loop_();
   bool start_server_();
   // Fills a 48-byte reply for a 48-byte (or longer) request; false means stay silent
-  bool build_reply_(const uint8_t *request, int64_t rx_local_us, uint8_t *reply);
+  bool build_reply_(const uint8_t *request, int64_t rx_local_us, uint16_t src_port, uint8_t *reply);
+
+  // ---- Driver-level receive timestamps ----
+  // The stack-level stamp is taken after the frame has crossed the driver and lwIP; that delay lands in the
+  // client's offset at half its size and no client can detect it. A hook on the Ethernet driver's input
+  // path stamps each NTP request before lwIP sees it, keyed so the reply path can find it again.
+  struct RxStamp {
+    std::atomic<uint32_t> seq{0};  // seqlock: odd = write in progress; 0 = never written
+    uint8_t key[RX_KEY_LEN]{};
+    int64_t t{0};
+  };
+  static constexpr int RX_RING = 8;
+  RxStamp rx_ring_[RX_RING];
+  uint8_t rx_ring_next_{0};  // only the driver task writes
+  void rx_record_(const uint8_t *key, int64_t t);
+  bool rx_lookup_(const uint8_t *key, int64_t now_us, int64_t *t_out);
+  int64_t choose_rx_stamp_(const uint8_t *request, uint16_t src_port, int64_t stack_us);
+  std::atomic<int32_t> rx_gain_sum_us_{0};
+  std::atomic<uint32_t> rx_gain_count_{0};
+  void measure_precision_();
+  uint32_t last_int_value_{0};
+  // Ties the capture counter to esp_timer: the midpoint of two esp_timer reads around a software latch.
+  // Called from the loop and from the Ethernet driver task, serialised by ref_lock_.
+  void sample_ref_(uint32_t *ticks, int64_t *us);
+  void note_interrupt_lead_(int64_t hook_us);
+  std::atomic<bool> rx_hook_active_{false};
+  std::atomic<bool> driver_rx_timestamp_{true};
+  bool install_rx_hook_requested_{true};
+  std::atomic<uint32_t> rx_hook_hits_{0};
+  std::atomic<uint32_t> rx_hook_misses_{0};
+#ifdef USE_ETHERNET
+  // priv is the esp_netif, exactly as the stock glue registers it: the IDF sets priv and the function
+  // pointer as two separate stores, so both functions must accept the same priv for the swap to be safe
+  static esp_err_t rx_hook(esp_eth_handle_t eth, uint8_t *buffer, uint32_t length, void *priv, void *info);
+  static PPSNTPServer *rx_hook_owner_;
+  bool install_rx_hook_();
+  esp_netif_t *eth_netif_{nullptr};
+#endif
+
+  // ---- ARP priming ----
+  // lwIP doesn't learn a client's MAC from its request, and entries expire after 5 minutes. A client
+  // polling less often finds a cold cache, so its reply waits on an ARP round trip after T3 is stamped.
+  static constexpr int ARP_SLOTS = 8;
+  std::atomic<uint32_t> arp_clients_[ARP_SLOTS]{};   // IPv4, network byte order; 0 = empty
+  std::atomic<uint32_t> arp_seen_ms_[ARP_SLOTS]{};   // last request from that client
+  std::atomic<uint8_t> arp_next_{0};
+  uint32_t arp_last_refresh_ms_{0};
+  uint32_t arp_requests_{0};
+  void note_client_ipv4_(uint32_t addr_be);
+  void refresh_arp_();
+
+  double root_dispersion_us_{250.0};
+  int8_t precision_{-20};
+  int rx_reference_pin_{-1};
 #ifdef USE_PPS_NTP_RAW_UDP
   // EXPERIMENTAL: serve from lwIP's tcpip thread, skipping the socket mailbox and task wake-up
   bool start_raw_udp_();
@@ -132,6 +208,7 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   mcpwm_cap_timer_handle_t cap_timer_{nullptr};
   mcpwm_cap_channel_handle_t cap_pps_{nullptr};  // latches on the PPS rising edge
   mcpwm_cap_channel_handle_t cap_ref_{nullptr};  // software-latched to tie capture ticks to esp_timer
+  mcpwm_cap_channel_handle_t cap_int_{nullptr};  // optional: the Ethernet chip's receive interrupt line
   double cap_ticks_per_us_{80.0};
   uint32_t last_cap_value_{0};
   int cap_group_{-1};
@@ -241,6 +318,11 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   sensor::Sensor *rejected_pulses_sensor_{nullptr};
   sensor::Sensor *nmea_errors_sensor_{nullptr};
   sensor::Sensor *pulse_age_sensor_{nullptr};
+  sensor::Sensor *rx_timestamp_gain_sensor_{nullptr};
+  sensor::Sensor *rx_interrupt_lead_sensor_{nullptr};
+  sensor::Sensor *arp_clients_sensor_{nullptr};
+  std::atomic<int32_t> int_lead_sum_us_{0};
+  std::atomic<uint32_t> int_lead_count_{0};
   sensor::Sensor *frequency_offset_sensor_{nullptr};
   sensor::Sensor *pps_jitter_sensor_{nullptr};
   sensor::Sensor *requests_sensor_{nullptr};

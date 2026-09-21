@@ -32,8 +32,10 @@ GNSS UART ─► NMEA RMC (which second) ┤
    - **u-blox 8 and later:** the schedule comes from `UBX-NAV-TIMELS`. Clients get LI=1 (or 2) during the final day, and the step happens exactly at midnight. An inserted second is served as a repeat of 23:59:59, as NTP servers conventionally do.
    - **u-blox 6/7 (no NAV-TIMELS):** the leap is taken from the receiver's own `23:59:60` sentence. There is no advance LI, and for roughly 0.1 s (until that sentence arrives) replies are one second fast.
    - Either way the fit is not reset and the server doesn't go silent.
-7. **Serving.** A dedicated FreeRTOS task, pinned to the core the ESPHome loop isn't using, answers NTPv3 and NTPv4 client requests. It timestamps each request as soon as it arrives and each reply just before sending.
-   - **Synced:** stratum 1, refid `GPS` (configurable). The precision field is 2^-20 s (about 1 µs) with hardware capture and 2^-18 s with the GPIO interrupt.
+7. **Serving.** A dedicated FreeRTOS task, pinned to the core the ESPHome loop isn't using (or, with `transport: raw_lwip`, lwIP's own thread), answers NTPv3 and NTPv4 client requests. Each reply is stamped just before sending.
+   - **Receive stamp (T2).** On Ethernet the component hooks the driver's input path and stamps each NTP request *before* lwIP sees it; the reply finds its stamp again by the client's transmit timestamp and source port. That takes the stack's receive delay out of the time clients compute — a delay no client can detect, since it only shows up as asymmetry. Without Ethernet, or if a request's stamp is missing, the stack-level stamp is used.
+   - **ARP priming.** lwIP doesn't learn a client's MAC from its requests and forgets entries after 5 minutes, so a client polling every 17 minutes would otherwise find the cache cold every time and its reply — already stamped — would wait out an ARP round trip. The component re-ARPs its most recent IPv4 clients (or the gateway, for off-subnet ones) every 2 minutes.
+   - **Synced:** stratum 1, refid `GPS` (configurable). The precision field is measured at boot from the system clock (normally 2^-19 s, the 1 µs `esp_timer` step). Root dispersion is `root_dispersion` (250 µs) plus 5 ppm of holdover drift.
    - **PPS lost:** keeps serving on the local crystal for `holdover` (stratum 1, with dispersion growing over time).
    - **After holdover:** replies with LI=3 and stratum 16.
    - **Never synced:** doesn't reply at all.
@@ -62,7 +64,7 @@ Wiring (example config):
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.5.2
+  - source: github://davidcoulson/esphome-pps-ntp@v0.6.0
     components: [pps_ntp]
 
 uart:
@@ -110,6 +112,9 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 | `require_utc_valid` | `false` | If `true`, never claim stratum 1 until the receiver confirms UTC over UBX. By default a receiver that doesn't answer UBX is trusted after 60 s, which can be one leap-second count off for up to about 12.5 minutes after a cold start. |
 | `transport` | `socket` | `raw_lwip` is **experimental**: it has served a few thousand requests on an ESP32-S3-ETH without trouble, and cut the median round trip by about 0.45 ms and the tail by more (see Limitations), but it hasn't had a long soak. It answers from lwIP's tcpip thread instead of a socket task, which removes the socket mailbox and a task wake-up from the timestamp path. `task_core` can't be combined with it. |
 | `task_core` | auto | Pins the NTP task to core `0` or `1`. By default it runs on the core the ESPHome loop isn't using. Rejected at validation on single-core chips (C2/C3/C5/C6/C61/H2/S2) and on an ESP32 built with `CONFIG_FREERTOS_UNICORE`. A compile-time `#error` catches anything else that ends up single-core. |
+| `driver_rx_timestamp` | `true` | Ethernet only: stamp requests in the Ethernet driver rather than where the server reads them (see Serving). Can be flipped at runtime from a lambda, `id(ntp).set_driver_rx_timestamp(false)`, for A/B measurement; `rx_timestamp_gain` keeps reporting either way. |
+| `root_dispersion` | `250us` | Base root dispersion advertised to clients: the error bound that nothing on the node can measure (network asymmetry, the transmit path through the Ethernet chip). Holdover drift is added on top. |
+| `rx_reference_pin` | none | **Diagnostic**, SPI Ethernet only. The Ethernet chip's interrupt GPIO as a plain number (W5500 `INT`, `10` on the Waveshare ESP32-S3-ETH). A spare MCPWM capture channel timestamps its falling edge, which measures how long a frame took from the wire-side interrupt to the driver hook (`rx_interrupt_lead`). Doesn't change served time. |
 | `update_interval` | `60s` | How often the sensors publish. |
 
 ### Sensors
@@ -126,6 +131,9 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 | `rejected_pulses` | sensor | PPS edges seen but not used: line noise, or pulses arriving without a fix. |
 | `nmea_errors` | sensor | NMEA sentences that failed their checksum. A rising count means a marginal serial link, usually the wrong baud or a long unshielded wire. |
 | `pulse_age` | sensor (s) | Seconds since the last accepted pulse, so brief dropouts show up in history even when it re-locks before the next update. |
+| `rx_timestamp_gain` | sensor (µs) | Mean of (stack stamp − driver stamp) over the update interval: how much receive delay the driver hook removes. |
+| `rx_interrupt_lead` | sensor (µs) | Mean of (driver stamp − Ethernet interrupt edge) over the update interval. Needs `rx_reference_pin`. The part of the receive path even the driver stamp can't see. |
+| `arp_clients` | sensor | IPv4 clients whose ARP entries are being kept warm. |
 | `synced` | binary sensor | On while serving stratum 1. |
 
 ## Diagnostics
@@ -133,7 +141,7 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 Every `update_interval` the component logs a status line at DEBUG:
 
 ```
-edges=61 accepted=60 nmea=122/0 bad ubx=9 utc_valid=YES fit=60/64 confirmed=57 residual=-0.8us jitter=1.2us sats=9 cno=39.2 strong=6 hdop=0.9 stack_free=2140
+edges=61 accepted=60 nmea=122/0 bad ubx=9 utc_valid=YES fit=60/64 confirmed=57 residual=-0.8us jitter=1.2us sats=9 cno=39.2 strong=6 hdop=0.9 stack_free=2140 rx_hook=812/3 arp=14
 ```
 
 - `edges` / `accepted`: PPS edges seen, and pulses that went into the fit.
@@ -141,12 +149,13 @@ edges=61 accepted=60 nmea=122/0 bad ubx=9 utc_valid=YES fit=60/64 confirmed=57 r
 - `confirmed`: RMC sentences that agreed with the pulse count since the last reset (3 are needed to serve).
 - `cno` / `strong`: mean signal strength, and how many satellites are at or above `strong_signal_threshold`. `hdop`: satellite geometry.
 - `stack_free`: the NTP task's stack high-water mark in bytes, or `n/a` on the raw lwIP transport, which has no task of its own.
+- `rx_hook=hits/misses`: requests that found their driver-level stamp, and ones that fell back to the stack stamp. `arp`: ARP requests sent to keep client entries warm.
 
 At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports when no PPS edges or no valid NMEA arrived during the interval. Those are the two symptoms of a wiring fault, and nothing else would log them.
 
 ## Tests
 
-`tests/run.sh` builds the component against stub headers on the host and runs it against a scripted receiver: a normal start with a baud switch, a receiver already at the target baud, glitch edges, a stalled loop with a lost sentence at the first label, a GPS week rollover, an oversized UBX frame, a receiver without UBX (with and without `require_utc_valid`), a cold start with UTC not yet valid, loss of fix, a 20-minute outage, a 5 ms PPS phase step, an inserted leap second both with and without advance notice, and the signal-strength calculation. Each scenario checks the time the server would hand out against the simulated truth. It exercises the logic only; it says nothing about real capture jitter or network delay.
+`tests/run.sh` builds the component against stub headers on the host and runs it against a scripted receiver: a normal start with a baud switch, a receiver already at the target baud, glitch edges, a stalled loop with a lost sentence at the first label, a GPS week rollover, an oversized UBX frame, a receiver without UBX (with and without `require_utc_valid`), a cold start with UTC not yet valid, loss of fix, a 20-minute outage, a 5 ms PPS phase step, an inserted leap second both with and without advance notice, the signal-strength calculation, Ethernet frame parsing for the driver hook (IPv4, IPv6, VLAN, fragments), receive-stamp lookup and fallback, and the ARP client table. Each scenario checks the time the server would hand out against the simulated truth. It exercises the logic only; it says nothing about real capture jitter or network delay.
 
 ## Testing without a receiver: `gnss_sim`
 
@@ -157,7 +166,7 @@ At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports wh
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.5.2
+  - source: github://davidcoulson/esphome-pps-ntp@v0.6.0
     components: [pps_ntp, gnss_sim]
 
 gnss_sim:
@@ -186,7 +195,7 @@ chronyc sources -v              # after adding "server <device-ip> iburst" to ch
 
 - IPv6 needs `network: enable_ipv6: true` in the node's config, which compiles IPv6 into lwIP. Both transports then answer on IPv4 and IPv6 (the socket transport with one dual-stack socket).
 - Leap seconds are only announced in advance (LI bits) with a receiver that supports `UBX-NAV-TIMELS` (u-blox 8 and later).
-- NTP packet timestamps are taken in software, not by the Ethernet hardware, so whatever the network path inside the node costs is invisible to them. Measured on an ESP32-S3-ETH (W5500 over SPI) from a wired host one router hop away, 400 requests per run:
+- NTP packet timestamps are taken in software, not by the Ethernet hardware. The driver-level receive stamp removes lwIP's share of the receive path, but the Ethernet chip, its SPI read-out and the whole transmit path stay invisible. Measured on an ESP32-S3-ETH (W5500 over SPI) from a wired host one router hop away, 400 requests per run:
 
   | | median RTT | p95 RTT |
   |---|---|---|

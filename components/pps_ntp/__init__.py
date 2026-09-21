@@ -51,6 +51,12 @@ CONF_REQUIRE_UTC_VALID = "require_utc_valid"
 CONF_STATIONARY = "stationary"
 CONF_TRIM_NMEA = "trim_nmea"
 CONF_TRANSPORT = "transport"
+CONF_DRIVER_RX_TIMESTAMP = "driver_rx_timestamp"
+CONF_ROOT_DISPERSION = "root_dispersion"
+CONF_RX_REFERENCE_PIN = "rx_reference_pin"
+CONF_RX_TIMESTAMP_GAIN = "rx_timestamp_gain"
+CONF_RX_INTERRUPT_LEAD = "rx_interrupt_lead"
+CONF_ARP_CLIENTS = "arp_clients"
 TRANSPORT_SOCKET = "socket"
 TRANSPORT_RAW_LWIP = "raw_lwip"
 
@@ -112,6 +118,42 @@ CONFIG_SCHEMA = cv.All(
             # EXPERIMENTAL raw_lwip: answer from lwIP's tcpip thread instead of a socket task
             cv.Optional(CONF_TRANSPORT, default=TRANSPORT_SOCKET): cv.one_of(
                 TRANSPORT_SOCKET, TRANSPORT_RAW_LWIP, lower=True
+            ),
+            # Ethernet only: stamp each request's arrival in the Ethernet driver, before lwIP, instead of
+            # where the server reads it. Removes the stack's receive delay from the time clients see.
+            cv.Optional(CONF_DRIVER_RX_TIMESTAMP, default=True): cv.boolean,
+            # Base root dispersion advertised to clients: the error bound nothing local can measure
+            # (network asymmetry, the transmit path). Holdover drift is added on top.
+            cv.Optional(CONF_ROOT_DISPERSION, default="250us"): cv.All(
+                cv.positive_time_period_microseconds,
+                cv.Range(min=cv.TimePeriod(microseconds=1), max=cv.TimePeriod(seconds=1)),
+            ),
+            # DIAGNOSTIC: the SPI Ethernet chip's interrupt GPIO (W5500 INT; GPIO10 on the Waveshare S3-ETH).
+            # A spare MCPWM capture channel timestamps its falling edge, measuring the receive delay the
+            # driver-level stamp still can't see. A plain number: the Ethernet component owns the pin.
+            cv.Optional(CONF_RX_REFERENCE_PIN): cv.int_range(min=0, max=56),
+            # Mean of (stack stamp - driver stamp) over the update interval: what driver_rx_timestamp removes
+            cv.Optional(CONF_RX_TIMESTAMP_GAIN): sensor.sensor_schema(
+                unit_of_measurement=UNIT_MICROSECOND,
+                icon="mdi:timer-sand",
+                accuracy_decimals=0,
+                state_class=STATE_CLASS_MEASUREMENT,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
+            # Mean of (driver stamp - interrupt edge) over the update interval; needs rx_reference_pin
+            cv.Optional(CONF_RX_INTERRUPT_LEAD): sensor.sensor_schema(
+                unit_of_measurement=UNIT_MICROSECOND,
+                icon="mdi:timer-sand",
+                accuracy_decimals=0,
+                state_class=STATE_CLASS_MEASUREMENT,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
+            # IPv4 clients whose ARP entries are being kept warm
+            cv.Optional(CONF_ARP_CLIENTS): sensor.sensor_schema(
+                icon="mdi:lan-connect",
+                accuracy_decimals=0,
+                state_class=STATE_CLASS_MEASUREMENT,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
             ),
             # Raise an older u-blox module (NEO-6M/7M/M8, GT-U7) to this baud using legacy UBX-CFG-PRT
             cv.Optional(CONF_GNSS_BAUD_RATE): cv.one_of(
@@ -232,9 +274,32 @@ def _final_validate_task_core(config):
     return config
 
 
+def _final_validate_rx_reference(config):
+    if CONF_RX_INTERRUPT_LEAD in config and CONF_RX_REFERENCE_PIN not in config:
+        raise cv.Invalid(
+            "rx_interrupt_lead needs rx_reference_pin", path=[CONF_RX_INTERRUPT_LEAD]
+        )
+    if CONF_RX_REFERENCE_PIN not in config:
+        return config
+    if (
+        not config[CONF_HARDWARE_CAPTURE]
+        or esp32.get_esp32_variant() not in MCPWM_VARIANTS
+    ):
+        raise cv.Invalid(
+            "rx_reference_pin needs MCPWM hardware capture", path=[CONF_RX_REFERENCE_PIN]
+        )
+    if "ethernet" not in fv.full_config.get():
+        raise cv.Invalid(
+            "rx_reference_pin is for an SPI Ethernet chip's interrupt line; there is no ethernet: block",
+            path=[CONF_RX_REFERENCE_PIN],
+        )
+    return config
+
+
 FINAL_VALIDATE_SCHEMA = cv.All(
     uart.final_validate_device_schema("pps_ntp", require_rx=True, require_tx=True),
     _final_validate_task_core,
+    _final_validate_rx_reference,
 )
 
 
@@ -257,6 +322,12 @@ async def to_code(config):
     cg.add(var.set_strong_threshold(config[CONF_STRONG_THRESHOLD]))
     cg.add(var.set_stationary(config[CONF_STATIONARY]))
     cg.add(var.set_trim_nmea(config[CONF_TRIM_NMEA]))
+    cg.add(var.set_install_rx_hook(config[CONF_DRIVER_RX_TIMESTAMP]))
+    cg.add(
+        var.set_root_dispersion_us(config[CONF_ROOT_DISPERSION].total_microseconds)
+    )
+    if CONF_RX_REFERENCE_PIN in config:
+        cg.add(var.set_rx_reference_pin(config[CONF_RX_REFERENCE_PIN]))
     if config[CONF_TRANSPORT] == TRANSPORT_RAW_LWIP:
         cg.add_define("USE_PPS_NTP_RAW_UDP")
     if CONF_TASK_CORE in config:
@@ -276,6 +347,9 @@ async def to_code(config):
         (CONF_FREQUENCY_OFFSET, "set_frequency_offset_sensor"),
         (CONF_PPS_JITTER, "set_pps_jitter_sensor"),
         (CONF_REQUESTS, "set_requests_sensor"),
+        (CONF_RX_TIMESTAMP_GAIN, "set_rx_timestamp_gain_sensor"),
+        (CONF_RX_INTERRUPT_LEAD, "set_rx_interrupt_lead_sensor"),
+        (CONF_ARP_CLIENTS, "set_arp_clients_sensor"),
     ):
         if conf := config.get(key):
             sens = await sensor.new_sensor(conf)

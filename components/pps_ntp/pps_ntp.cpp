@@ -20,6 +20,16 @@
 #include <lwip/udp.h>
 #endif
 
+#ifdef USE_ESP32
+#include <lwip/etharp.h>
+#include <lwip/ip4_addr.h>
+#include <lwip/netif.h>
+#endif
+
+#ifdef USE_ETHERNET
+#include "esphome/components/ethernet/ethernet_component.h"
+#endif
+
 #if defined(USE_PPS_NTP_TASK_CORE) && CONFIG_FREERTOS_NUMBER_OF_CORES < 2
 #error "pps_ntp: task_core is set, but this build has a single FreeRTOS core"
 #endif
@@ -47,8 +57,64 @@ static constexpr uint32_t BAUD_VERIFY_MS = 4000;
 static constexpr uint32_t BAUD_RETRY_MS = 5000;
 static constexpr uint8_t BAUD_MAX_ATTEMPTS = 3;
 static constexpr uint64_t NTP_UNIX_OFFSET = 2208988800ULL;  // seconds from 1900 to 1970
-static constexpr double DISPERSION_BASE_US = 20.0;
 static constexpr double HOLDOVER_DRIFT_PPM = 5.0;
+static constexpr int64_t RX_STAMP_MAX_AGE_US = 50000;  // a driver stamp older than this belongs to someone else
+static constexpr uint32_t ARP_REFRESH_MS = 120000;     // lwIP drops ARP entries after 300 s
+static constexpr uint32_t ARP_CLIENT_IDLE_MS = 7200000;  // stop priming a client silent this long (> max poll 1024 s)
+
+// ---------------------------------------------------------------------------
+// Frame parsing for the driver-level receive hook
+
+static uint16_t get_be16(const uint8_t *p) { return static_cast<uint16_t>((p[0] << 8) | p[1]); }
+
+bool parse_ntp_request_frame(const uint8_t *frame, uint32_t length, uint16_t port, uint8_t *key) {
+  static constexpr uint32_t NTP_LEN = 48;
+  if (length < 14)
+    return false;
+  uint32_t off = 12;
+  uint16_t ethertype = get_be16(frame + off);
+  if (ethertype == 0x8100) {  // one 802.1Q tag
+    off += 4;
+    if (length < off + 2)
+      return false;
+    ethertype = get_be16(frame + off);
+  }
+  off += 2;
+
+  const uint8_t *udp;
+  if (ethertype == 0x0800) {
+    if (length < off + 20)
+      return false;
+    const uint8_t *ip = frame + off;
+    uint32_t ihl = (ip[0] & 0x0F) * 4u;
+    if ((ip[0] >> 4) != 4 || ihl < 20 || ip[9] != 17)
+      return false;
+    if ((get_be16(ip + 6) & 0x3FFF) != 0)
+      return false;  // a fragment: only the first carries the UDP header, and NTP requests are never this big
+    off += ihl;
+  } else if (ethertype == 0x86DD) {
+    if (length < off + 40)
+      return false;
+    const uint8_t *ip = frame + off;
+    if ((ip[0] >> 4) != 6 || ip[6] != 17)
+      return false;  // extension headers: not worth walking for NTP
+    off += 40;
+  } else {
+    return false;
+  }
+  if (length < off + 8 + NTP_LEN)
+    return false;
+  udp = frame + off;
+  if (get_be16(udp + 2) != port)
+    return false;
+  const uint8_t *ntp = udp + 8;
+  if ((ntp[0] & 0x07) != 3)
+    return false;
+  memcpy(key, ntp + 40, 8);
+  key[8] = udp[0];  // source port, as sent
+  key[9] = udp[1];
+  return true;
+}
 
 // Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm)
 static int64_t days_from_civil(int y, int m, int d) {
@@ -109,6 +175,7 @@ void IRAM_ATTR PPSNTPServer::pps_isr(PPSNTPServer *self) {
 
 void PPSNTPServer::setup() {
   this->boot_ms_ = millis();
+  this->measure_precision_();
   this->hist_local_.assign(this->fit_window_, 0);
   this->hist_utc_.assign(this->fit_window_, 0);
   // Always apply the YAML pin mode (pull-up/down); MCPWM only routes the pad to its capture input
@@ -138,6 +205,14 @@ void PPSNTPServer::loop() {
       return;
     }
     this->server_started_ = true;
+#ifdef USE_ETHERNET
+    if (this->install_rx_hook_requested_)
+      this->rx_hook_active_ = this->install_rx_hook_();
+#endif
+  }
+  if (this->server_started_ && millis() - this->arp_last_refresh_ms_ >= ARP_REFRESH_MS) {
+    this->arp_last_refresh_ms_ = millis();
+    this->refresh_arp_();
   }
 
   // Pulses before NMEA: the RMC that labels a pulse must find that pulse already recorded
@@ -227,6 +302,21 @@ bool PPSNTPServer::setup_capture_() {
     channel_config.flags.invert_cap_signal = false;
     err = mcpwm_new_capture_channel(this->cap_timer_, &channel_config, &this->cap_ref_);
   }
+  if (err == ESP_OK && this->rx_reference_pin_ >= 0) {
+    // The Ethernet chip's interrupt line (active low), read through the GPIO matrix alongside the
+    // driver's own interrupt on the same pad. Optional: a failure here only loses the diagnostic.
+    mcpwm_capture_channel_config_t int_config = {};
+    int_config.gpio_num = this->rx_reference_pin_;
+    int_config.prescale = 1;
+    int_config.flags.neg_edge = true;
+    if (mcpwm_new_capture_channel(this->cap_timer_, &int_config, &this->cap_int_) != ESP_OK) {
+      ESP_LOGW(TAG, "No MCPWM capture channel for rx_reference_pin; interrupt lead unavailable");
+      this->cap_int_ = nullptr;
+    } else if (mcpwm_capture_channel_enable(this->cap_int_) != ESP_OK) {
+      mcpwm_del_capture_channel(this->cap_int_);
+      this->cap_int_ = nullptr;
+    }
+  }
   // No callbacks are registered, so the driver never installs an interrupt; loop() polls the latches
   bool pps_enabled = false, ref_enabled = false, timer_enabled = false, timer_started = false;
   if (err == ESP_OK)
@@ -255,13 +345,19 @@ bool PPSNTPServer::setup_capture_() {
       mcpwm_del_capture_channel(this->cap_pps_);
     if (this->cap_ref_ != nullptr)
       mcpwm_del_capture_channel(this->cap_ref_);
+    if (this->cap_int_ != nullptr) {
+      mcpwm_capture_channel_disable(this->cap_int_);
+      mcpwm_del_capture_channel(this->cap_int_);
+    }
     mcpwm_del_capture_timer(this->cap_timer_);
-    this->cap_pps_ = this->cap_ref_ = nullptr;
+    this->cap_pps_ = this->cap_ref_ = this->cap_int_ = nullptr;
     this->cap_timer_ = nullptr;
     return false;
   }
   this->cap_ticks_per_us_ = resolution_hz / 1e6;
   mcpwm_capture_get_latched_value(this->cap_pps_, &this->last_cap_value_);
+  if (this->cap_int_ != nullptr)
+    mcpwm_capture_get_latched_value(this->cap_int_, &this->last_int_value_);
   return true;
 #else
   return false;
@@ -276,20 +372,53 @@ void PPSNTPServer::poll_capture_() {
     return;
   this->last_cap_value_ = pulse_ticks;
 
-  // Latch the capture timer "now" between two esp_timer reads, with nothing able to preempt us,
-  // to place the hardware-captured edge on the esp_timer timeline
+  uint32_t ref_ticks;
+  int64_t ref_us;
+  this->sample_ref_(&ref_ticks, &ref_us);
+
+  // The 32-bit counter wraps every ~53 s (80 MHz); the signed difference is valid for ~26 s
+  int32_t ticks_since_edge = static_cast<int32_t>(ref_ticks - pulse_ticks);
+  double edge_us = ref_us - ticks_since_edge / this->cap_ticks_per_us_;
+  this->handle_pulse_(llround(edge_us));
+#endif
+}
+
+void PPSNTPServer::sample_ref_(uint32_t *ticks, int64_t *us) {
+#ifdef USE_PPS_NTP_MCPWM
+  // Latch the capture timer "now" between two esp_timer reads, with nothing able to preempt us, to
+  // place captured edges on the esp_timer timeline. The lock also keeps the loop and the Ethernet
+  // driver task from latching over each other's reading.
   portENTER_CRITICAL(&this->ref_lock_);
   int64_t before_us = esp_timer_get_time();
   mcpwm_capture_channel_trigger_soft_catch(this->cap_ref_);
   int64_t after_us = esp_timer_get_time();
+  mcpwm_capture_get_latched_value(this->cap_ref_, ticks);
   portEXIT_CRITICAL(&this->ref_lock_);
-  uint32_t ref_ticks;
-  mcpwm_capture_get_latched_value(this->cap_ref_, &ref_ticks);
+  *us = (before_us + after_us) / 2;
+#endif
+}
 
-  // The 32-bit counter wraps every ~53 s (80 MHz); the signed difference is valid for ~26 s
-  int32_t ticks_since_edge = static_cast<int32_t>(ref_ticks - pulse_ticks);
-  double edge_us = (before_us + after_us) * 0.5 - ticks_since_edge / this->cap_ticks_per_us_;
-  this->handle_pulse_(llround(edge_us));
+// Driver task. Places the most recent falling edge of the Ethernet chip's interrupt line on the esp_timer
+// timeline and records how long before the driver hook it happened: the part of the receive path (SPI
+// read-out, task wake-up) that even the driver-level stamp can't see.
+void PPSNTPServer::note_interrupt_lead_(int64_t hook_us) {
+#ifdef USE_PPS_NTP_MCPWM
+  if (this->cap_int_ == nullptr)
+    return;
+  uint32_t int_ticks;
+  mcpwm_capture_get_latched_value(this->cap_int_, &int_ticks);
+  if (int_ticks == this->last_int_value_)
+    return;  // no new edge: the line was already low for an earlier frame
+  this->last_int_value_ = int_ticks;
+  uint32_t ref_ticks;
+  int64_t ref_us;
+  this->sample_ref_(&ref_ticks, &ref_us);
+  double edge_us = ref_us - static_cast<int32_t>(ref_ticks - int_ticks) / this->cap_ticks_per_us_;
+  double lead = static_cast<double>(hook_us) - edge_us;
+  if (lead < 0 || lead > 20000)
+    return;  // not this frame's edge
+  this->int_lead_sum_us_ += static_cast<int32_t>(lead);
+  this->int_lead_count_++;
 #endif
 }
 
@@ -305,6 +434,22 @@ void PPSNTPServer::poll_isr_() {
   }
   this->seen_pulse_count_ = count;
   this->handle_pulse_(pulse_us);
+}
+
+// RFC 5905 precision: log2 of the time it takes to read the clock, taken as the smallest step between two
+// consecutive reads that differ (esp_timer counts whole microseconds, so this is normally 2^-19 s)
+void PPSNTPServer::measure_precision_() {
+  int64_t smallest = INT64_MAX;
+  int64_t previous = esp_timer_get_time();
+  for (int i = 0; i < 2000; i++) {
+    int64_t now = esp_timer_get_time();
+    if (now != previous && now - previous < smallest)
+      smallest = now - previous;
+    previous = now;
+  }
+  if (smallest == INT64_MAX)
+    smallest = 1;
+  this->precision_ = static_cast<int8_t>(std::ceil(std::log2(static_cast<double>(smallest) * 1e-6)));
 }
 
 void PPSNTPServer::update() {
@@ -333,6 +478,21 @@ void PPSNTPServer::update() {
     this->requests_sensor_->publish_state(this->requests_.load() & 0xFFFFFF);
   if (this->synced_binary_sensor_ != nullptr)
     this->synced_binary_sensor_->publish_state(this->last_synced_);
+  // Interval averages; a quiet interval publishes nothing rather than a misleading zero
+  uint32_t gain_n = this->rx_gain_count_.exchange(0);
+  int32_t gain_sum = this->rx_gain_sum_us_.exchange(0);
+  if (this->rx_timestamp_gain_sensor_ != nullptr && gain_n > 0)
+    this->rx_timestamp_gain_sensor_->publish_state(static_cast<float>(gain_sum) / gain_n);
+  uint32_t lead_n = this->int_lead_count_.exchange(0);
+  int32_t lead_sum = this->int_lead_sum_us_.exchange(0);
+  if (this->rx_interrupt_lead_sensor_ != nullptr && lead_n > 0)
+    this->rx_interrupt_lead_sensor_->publish_state(static_cast<float>(lead_sum) / lead_n);
+  if (this->arp_clients_sensor_ != nullptr) {
+    int active = 0;
+    for (auto &client : this->arp_clients_)
+      active += client.load() != 0;
+    this->arp_clients_sensor_->publish_state(active);
+  }
   this->log_status_();
 }
 
@@ -356,12 +516,14 @@ void PPSNTPServer::log_status_() {
   }
   ESP_LOGD(TAG,
            "edges=%u accepted=%u nmea=%u/%u bad ubx=%u utc_valid=%s fit=%d/%d confirmed=%u residual=%.1fus "
-           "jitter=%.1fus sats=%d cno=%.1f strong=%d hdop=%.1f stack_free=%s",
+           "jitter=%.1fus sats=%d cno=%.1f strong=%d hdop=%.1f stack_free=%s rx_hook=%u/%u arp=%u",
            static_cast<unsigned>(this->edges_seen_), static_cast<unsigned>(this->pulses_accepted_),
            static_cast<unsigned>(this->nmea_ok_), static_cast<unsigned>(this->nmea_bad_),
            static_cast<unsigned>(this->ubx_frames_), YESNO(this->utc_trusted_), this->hist_count_, this->fit_window_,
            static_cast<unsigned>(this->label_confirmations_), this->last_residual_us_, std::sqrt(this->jitter_sq_us_),
-           this->satellites_, this->cno_mean_, this->strong_satellites_, this->hdop_, stack_free);
+           this->satellites_, this->cno_mean_, this->strong_satellites_, this->hdop_, stack_free,
+           static_cast<unsigned>(this->rx_hook_hits_.load()), static_cast<unsigned>(this->rx_hook_misses_.load()),
+           static_cast<unsigned>(this->arp_requests_));
 }
 
 void PPSNTPServer::dump_config() {
@@ -385,10 +547,29 @@ void PPSNTPServer::dump_config() {
                 "  Stationary model: %s\n"
                 "  Trim NMEA output: %s\n"
                 "  Refid: %.4s\n"
-                "  Require UTC valid: %s",
+                "  Require UTC valid: %s\n"
+                "  Root dispersion: %.0f µs\n"
+                "  Precision: 2^%d s",
                 this->port_, static_cast<unsigned>(this->holdover_us_ / 1000000), this->fit_window_,
                 this->max_residual_us_, this->strong_threshold_, YESNO(this->stationary_),
-                YESNO(this->trim_nmea_), this->refid_, YESNO(this->require_utc_valid_));
+                YESNO(this->trim_nmea_), this->refid_, YESNO(this->require_utc_valid_), this->root_dispersion_us_,
+                this->precision_);
+#ifdef USE_ETHERNET
+  if (!this->install_rx_hook_requested_) {
+    ESP_LOGCONFIG(TAG, "  Receive timestamp: network stack (driver hook disabled)");
+  } else {
+    ESP_LOGCONFIG(TAG, "  Receive timestamp: %s",
+                  this->rx_hook_active_ ? "Ethernet driver" : "network stack (driver hook not installed yet)");
+  }
+#else
+  ESP_LOGCONFIG(TAG, "  Receive timestamp: network stack");
+#endif
+#ifdef USE_PPS_NTP_MCPWM
+  if (this->rx_reference_pin_ >= 0) {
+    ESP_LOGCONFIG(TAG, "  Rx reference pin: GPIO%d (%s)", this->rx_reference_pin_,
+                  this->cap_int_ != nullptr ? "MCPWM capture" : "unavailable");
+  }
+#endif
 #ifdef USE_PPS_NTP_RAW_UDP
   ESP_LOGCONFIG(TAG, "  Transport: raw lwIP (experimental)");
 #else
@@ -416,6 +597,9 @@ void PPSNTPServer::dump_config() {
   LOG_SENSOR("  ", "Frequency Offset", this->frequency_offset_sensor_);
   LOG_SENSOR("  ", "PPS Jitter", this->pps_jitter_sensor_);
   LOG_SENSOR("  ", "Requests", this->requests_sensor_);
+  LOG_SENSOR("  ", "Rx Timestamp Gain", this->rx_timestamp_gain_sensor_);
+  LOG_SENSOR("  ", "Rx Interrupt Lead", this->rx_interrupt_lead_sensor_);
+  LOG_SENSOR("  ", "ARP Clients", this->arp_clients_sensor_);
   LOG_BINARY_SENSOR("  ", "Synced", this->synced_binary_sensor_);
 }
 
@@ -987,18 +1171,20 @@ void PPSNTPServer::service_baud_switch_() {
 // ---------------------------------------------------------------------------
 // NTP server
 
-bool PPSNTPServer::build_reply_(const uint8_t *request, int64_t rx_local_us, uint8_t *reply) {
+bool PPSNTPServer::build_reply_(const uint8_t *request, int64_t rx_local_us, uint16_t src_port, uint8_t *reply) {
   uint8_t version = (request[0] >> 3) & 0x07;
   uint8_t mode = request[0] & 0x07;
   if (mode != 3 || version < 1 || version > 4)
     return false;
+  rx_local_us = this->choose_rx_stamp_(request, src_port, rx_local_us);
 
   ClockModel model = this->get_model_();
   if (!model.valid)
     return false;  // never synchronised: stay silent rather than hand out a bogus time
   bool synced = this->is_synced_(model, rx_local_us);
   double age_s = static_cast<double>(rx_local_us - model.last_pulse_local_us) / 1e6;
-  double dispersion_us = DISPERSION_BASE_US + HOLDOVER_DRIFT_PPM * age_s;
+  // The base covers what no local measurement can see: network asymmetry and the receive/transmit paths
+  double dispersion_us = this->root_dispersion_us_ + HOLDOVER_DRIFT_PPM * age_s;
 
   memset(reply, 0, 48);
   // LI: 3 = unsynchronised; 1/2 = the last minute of today has 61/59 seconds
@@ -1011,8 +1197,7 @@ bool PPSNTPServer::build_reply_(const uint8_t *request, int64_t rx_local_us, uin
   reply[0] = (li << 6) | (version << 3) | 4;  // LI, VN, mode = server
   reply[1] = synced ? 1 : 16;
   reply[2] = request[2];  // poll
-  // Precision: hardware capture ~1 us (2^-20 s); the GPIO interrupt adds a few us of latency jitter (2^-18)
-  reply[3] = static_cast<uint8_t>(this->hw_capture_ ? -20 : -18);
+  reply[3] = static_cast<uint8_t>(this->precision_);
   put_be32(reply + 8, static_cast<uint32_t>(std::min(dispersion_us * 65536.0 / 1e6, 4294967295.0)));
   memcpy(reply + 12, this->refid_, 4);
   put_ntp_timestamp(reply + 16, internal_to_utc_us(model, model.anchor_utc_s * 1000000LL));
@@ -1021,6 +1206,166 @@ bool PPSNTPServer::build_reply_(const uint8_t *request, int64_t rx_local_us, uin
   put_ntp_timestamp(reply + 40, utc_us_at(model, esp_timer_get_time()));  // last: as close to the send as we get
   this->requests_++;
   return true;
+}
+
+// Single writer (the Ethernet driver task); readers retry nothing, they just miss on a torn read
+void PPSNTPServer::rx_record_(const uint8_t *key, int64_t t) {
+  RxStamp &slot = this->rx_ring_[this->rx_ring_next_];
+  this->rx_ring_next_ = (this->rx_ring_next_ + 1) % RX_RING;
+  uint32_t seq = slot.seq.load(std::memory_order_relaxed);
+  slot.seq.store(seq + 1, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
+  memcpy(slot.key, key, RX_KEY_LEN);
+  slot.t = t;
+  slot.seq.store(seq + 2, std::memory_order_release);
+}
+
+bool PPSNTPServer::rx_lookup_(const uint8_t *key, int64_t now_us, int64_t *t_out) {
+  for (auto &slot : this->rx_ring_) {
+    uint32_t before = slot.seq.load(std::memory_order_acquire);
+    if (before == 0 || (before & 1) != 0)
+      continue;
+    uint8_t slot_key[RX_KEY_LEN];
+    memcpy(slot_key, slot.key, RX_KEY_LEN);
+    int64_t t = slot.t;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (slot.seq.load(std::memory_order_relaxed) != before)
+      continue;
+    if (memcmp(slot_key, key, RX_KEY_LEN) == 0 && t <= now_us && now_us - t < RX_STAMP_MAX_AGE_US) {
+      *t_out = t;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Prefers the driver-level stamp for this request when there is one. The stack stamp is always the later
+// of the two; the difference is what the driver hook buys, reported as rx_timestamp_gain.
+int64_t PPSNTPServer::choose_rx_stamp_(const uint8_t *request, uint16_t src_port, int64_t stack_us) {
+  if (!this->rx_hook_active_.load(std::memory_order_relaxed))
+    return stack_us;
+  uint8_t key[RX_KEY_LEN];
+  memcpy(key, request + 40, 8);
+  key[8] = src_port >> 8;
+  key[9] = src_port & 0xFF;
+  int64_t hook_us;
+  if (!this->rx_lookup_(key, stack_us, &hook_us)) {
+    this->rx_hook_misses_++;
+    return stack_us;
+  }
+  this->rx_hook_hits_++;
+  this->rx_gain_sum_us_ += static_cast<int32_t>(stack_us - hook_us);
+  this->rx_gain_count_++;
+  return this->driver_rx_timestamp_.load(std::memory_order_relaxed) ? hook_us : stack_us;
+}
+
+#ifdef USE_ETHERNET
+PPSNTPServer *PPSNTPServer::rx_hook_owner_ = nullptr;
+
+// Ethernet driver task, for every received frame. Stamp first, then hand the frame on exactly as the stock
+// glue would; the frame belongs to the network stack from esp_netif_receive() on, so it's parsed before.
+esp_err_t PPSNTPServer::rx_hook(esp_eth_handle_t eth, uint8_t *buffer, uint32_t length, void *priv, void *info) {
+  int64_t now = esp_timer_get_time();
+  PPSNTPServer *self = rx_hook_owner_;
+  uint8_t key[RX_KEY_LEN];
+  if (self != nullptr && parse_ntp_request_frame(buffer, length, self->port_, key)) {
+    self->rx_record_(key, now);
+    self->note_interrupt_lead_(now);
+  }
+  return esp_netif_receive(static_cast<esp_netif_t *>(priv), buffer, length, nullptr);
+}
+
+bool PPSNTPServer::install_rx_hook_() {
+#if CONFIG_ESP_NETIF_L2_TAP
+  ESP_LOGW(TAG, "L2 TAP is enabled; not replacing the Ethernet input path, so receive stamps come from the stack");
+  return false;
+#else
+  auto *eth = ethernet::global_eth_component;
+  if (eth == nullptr || eth->get_eth_handle() == nullptr || eth->get_esp_netif() == nullptr) {
+    ESP_LOGW(TAG, "No Ethernet driver handle; receive stamps come from the network stack");
+    return false;
+  }
+  rx_hook_owner_ = this;
+  // priv stays the esp_netif the stock glue registered, so a frame caught mid-swap is handled either way
+  esp_err_t err = esp_eth_update_input_path_info(eth->get_eth_handle(), PPSNTPServer::rx_hook, eth->get_esp_netif());
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Could not hook the Ethernet input path (%s)", esp_err_to_name(err));
+    return false;
+  }
+  ESP_LOGI(TAG, "Receive timestamps taken in the Ethernet driver");
+  return true;
+#endif
+}
+#endif  // USE_ETHERNET
+
+// Called per request from the serving context. Lock-free: a lost race only costs one missed priming.
+void PPSNTPServer::note_client_ipv4_(uint32_t addr_be) {
+  if (addr_be == 0)
+    return;
+  uint32_t now_ms = millis();
+  for (int i = 0; i < ARP_SLOTS; i++) {
+    if (this->arp_clients_[i].load(std::memory_order_relaxed) == addr_be) {
+      this->arp_seen_ms_[i].store(now_ms, std::memory_order_relaxed);
+      return;
+    }
+  }
+  // New client: take an empty slot, else the least recently heard one
+  int pick = 0;
+  uint32_t oldest_age = 0;
+  for (int i = 0; i < ARP_SLOTS; i++) {
+    if (this->arp_clients_[i].load(std::memory_order_relaxed) == 0) {
+      pick = i;
+      break;
+    }
+    uint32_t age = now_ms - this->arp_seen_ms_[i].load(std::memory_order_relaxed);
+    if (age > oldest_age) {
+      oldest_age = age;
+      pick = i;
+    }
+  }
+  this->arp_seen_ms_[pick].store(now_ms, std::memory_order_relaxed);
+  this->arp_clients_[pick].store(addr_be, std::memory_order_relaxed);
+}
+
+// lwIP never learns a sender's MAC from its IP traffic and forgets entries after 5 minutes, so a client
+// polling every 17 minutes would otherwise find the cache cold on every request: the reply, already
+// stamped, then waits a full ARP round trip. Asking each recent client (or, off-subnet, the gateway)
+// every two minutes keeps its entry fresh.
+void PPSNTPServer::refresh_arp_() {
+#ifdef USE_ESP32
+  uint32_t now_ms = millis();
+  LwIPLock lock;
+  uint32_t gateways[ARP_SLOTS];
+  int gateway_count = 0;
+  for (int i = 0; i < ARP_SLOTS; i++) {
+    uint32_t addr_be = this->arp_clients_[i].load(std::memory_order_relaxed);
+    if (addr_be == 0)
+      continue;
+    if (now_ms - this->arp_seen_ms_[i].load(std::memory_order_relaxed) > ARP_CLIENT_IDLE_MS) {
+      this->arp_clients_[i].store(0, std::memory_order_relaxed);
+      continue;
+    }
+    ip4_addr_t target;
+    ip4_addr_set_u32(&target, addr_be);
+    struct netif *nif = ip4_route(&target);
+    if (nif == nullptr || (nif->flags & NETIF_FLAG_ETHARP) == 0)
+      continue;
+    if (!ip4_addr_net_eq(&target, netif_ip4_addr(nif), netif_ip4_netmask(nif))) {
+      target = *netif_ip4_gw(nif);
+      if (ip4_addr_isany_val(target))
+        continue;
+      uint32_t gw = ip4_addr_get_u32(&target);
+      bool done = false;
+      for (int g = 0; g < gateway_count; g++)
+        done |= gateways[g] == gw;
+      if (done)
+        continue;
+      gateways[gateway_count++] = gw;
+    }
+    if (etharp_request(nif, &target) == ERR_OK)
+      this->arp_requests_++;
+  }
+#endif
 }
 
 bool PPSNTPServer::start_server_() {
@@ -1076,8 +1421,13 @@ void PPSNTPServer::raw_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
       pbuf_copy_partial(p, request, sizeof(request), 0) == sizeof(request)) {
     struct pbuf *out = pbuf_alloc(PBUF_TRANSPORT, 48, PBUF_RAM);
     if (out != nullptr) {
-      if (self->build_reply_(request, rx_local, static_cast<uint8_t *>(out->payload)))
+      if (self->build_reply_(request, rx_local, port, static_cast<uint8_t *>(out->payload))) {
         udp_sendto(pcb, out, addr, port);
+#if LWIP_IPV4
+        if (IP_IS_V4(addr))
+          self->note_client_ipv4_(ip4_addr_get_u32(ip_2_ip4(addr)));
+#endif
+      }
       pbuf_free(out);
     }
   }
@@ -1132,8 +1482,24 @@ void PPSNTPServer::ntp_loop_() {
       if (received < 48)
         continue;
       uint8_t reply[48];
-      if (this->build_reply_(request, rx_local, reply))
+      uint16_t src_port;
+      uint32_t src_v4 = 0;  // network byte order; 0 = not IPv4
+#if LWIP_IPV6
+      const auto *src6 = reinterpret_cast<const struct sockaddr_in6 *>(&source);
+      src_port = ntohs(src6->sin6_port);
+      const uint8_t *a = reinterpret_cast<const uint8_t *>(&src6->sin6_addr);
+      static const uint8_t V4_MAPPED[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+      if (memcmp(a, V4_MAPPED, 12) == 0)
+        memcpy(&src_v4, a + 12, 4);
+#else
+      const auto *src4 = reinterpret_cast<const struct sockaddr_in *>(&source);
+      src_port = ntohs(src4->sin_port);
+      src_v4 = src4->sin_addr.s_addr;
+#endif
+      if (this->build_reply_(request, rx_local, src_port, reply)) {
         sendto(sock, reply, sizeof(reply), 0, reinterpret_cast<struct sockaddr *>(&source), source_len);
+        this->note_client_ipv4_(src_v4);
+      }
     }
     close(sock);
   }

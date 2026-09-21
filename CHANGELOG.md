@@ -4,6 +4,15 @@ Hardware status: run on an ESP32-S3-ETH against the `gnss_sim` emulator. Not yet
 
 ## Unreleased
 
+## v0.6.0 - 2026-09-21
+Ideas from [tiehfood/esphome-gps-pps-ntp-server](https://github.com/tiehfood/esphome-gps-pps-ntp-server). Not yet run on hardware.
+- **Driver-level receive timestamps** (`driver_rx_timestamp`, default on, Ethernet only): NTP requests are stamped in the Ethernet driver's input path before lwIP, and replies use that stamp as T2. Switchable at runtime; new `rx_timestamp_gain` sensor reports what it removes.
+- **ARP priming:** recent IPv4 clients (or the gateway, for off-subnet clients) are re-ARPed every 2 minutes so a slow-polling client's reply never waits on ARP. New `arp_clients` sensor.
+- `root_dispersion` (default 250 µs) replaces the fixed 20 µs, which claimed far more than an SPI Ethernet path can deliver.
+- Precision is measured from the clock at boot (normally 2^-19 s) instead of being assumed from the capture mode.
+- `rx_reference_pin` (diagnostic): MCPWM-capture the SPI Ethernet chip's interrupt line; new `rx_interrupt_lead` sensor.
+- Status line gains `rx_hook=hits/misses` and `arp`.
+
 ## v0.5.2 - 2026-09-20
 - Repeat the constellation report in `dump_config()`. ESPHome replays the config dump to every log client that connects, so a one-shot INFO line at boot was in practice invisible.
 
