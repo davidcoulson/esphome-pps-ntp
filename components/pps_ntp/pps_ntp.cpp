@@ -463,7 +463,8 @@ void PPSNTPServer::update() {
   if (this->hdop_sensor_ != nullptr && this->hdop_valid_)
     this->hdop_sensor_->publish_state(this->hdop_);
   if (this->rejected_pulses_sensor_ != nullptr)
-    this->rejected_pulses_sensor_->publish_state(this->edges_seen_ - this->pulses_accepted_);
+    this->rejected_pulses_sensor_->publish_state(
+        this->edges_seen_ >= this->pulses_accepted_ ? this->edges_seen_ - this->pulses_accepted_ : 0);
   if (this->nmea_errors_sensor_ != nullptr)
     this->nmea_errors_sensor_->publish_state(this->nmea_bad_);
   if (this->pulse_age_sensor_ != nullptr && model.valid) {
@@ -673,7 +674,11 @@ void PPSNTPServer::accept_pulse_(int64_t local_us, int64_t utc_s) {
     this->hist_count_++;
   this->last_accepted_local_us_ = local_us;
   this->last_accepted_utc_s_ = utc_s;
-  this->pulses_accepted_++;
+  // A reset re-labels the pulse it happened on, which can then be accepted a second time: count edges, not calls
+  if (local_us != this->last_counted_pulse_us_) {
+    this->last_counted_pulse_us_ = local_us;
+    this->pulses_accepted_++;
+  }
 
   // Least-squares fit of local time against UTC seconds, relative to the newest pulse
   double rate = 1e6;

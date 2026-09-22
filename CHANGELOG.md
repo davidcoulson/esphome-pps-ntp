@@ -4,6 +4,9 @@ Hardware status: run on an ESP32-S3-ETH against the `gnss_sim` emulator. Not yet
 
 ## Unreleased
 
+## v0.6.1 - 2026-09-21
+- Fix: `rejected_pulses` could underflow to 4294967295 (shown as 4294967296). When three RMCs disagreed with the pulse count, the fit reset and the same pulse was re-labelled and counted as accepted twice. Each edge is now counted at most once. Served time was never affected. Seen on hardware (weak-signal cold start); a sim check now runs across every scenario.
+
 ## v0.6.0 - 2026-09-21
 Ideas from [tiehfood/esphome-gps-pps-ntp-server](https://github.com/tiehfood/esphome-gps-pps-ntp-server). Not yet run on hardware.
 - **Driver-level receive timestamps** (`driver_rx_timestamp`, default on, Ethernet only): NTP requests are stamped in the Ethernet driver's input path before lwIP, and replies use that stamp as T2. Switchable at runtime; new `rx_timestamp_gain` sensor reports what it removes.

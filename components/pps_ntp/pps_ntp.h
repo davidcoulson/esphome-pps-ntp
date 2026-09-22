@@ -240,6 +240,7 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   // Diagnostics, reported by update()
   uint32_t edges_seen_{0};
   uint32_t pulses_accepted_{0};
+  int64_t last_counted_pulse_us_{-1};  // the edge pulses_accepted_ last counted
   uint32_t nmea_ok_{0};
   uint32_t nmea_bad_{0};
   uint32_t ubx_frames_{0};

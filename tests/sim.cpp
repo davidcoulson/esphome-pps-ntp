@@ -11,6 +11,7 @@
 
 int64_t g_now_us = 0;
 bool g_log = false;
+static bool g_counter_underflow = false;  // set if any scenario accepted more pulses than it saw
 
 using namespace esphome;
 using namespace esphome::pps_ntp;
@@ -205,6 +206,11 @@ struct Sim : PPSNTPServer {
       if ((g_now_us / 1000) % 10 == 0 && !stalled(g_now_us)) {
         this->loop();
         service_tx();
+      }
+      if (this->pulses_accepted_ > this->edges_seen_ && !g_counter_underflow) {
+        g_counter_underflow = true;
+        printf("    !! pulses_accepted (%u) > edges_seen (%u) at t=%.3f s\n", this->pulses_accepted_, this->edges_seen_,
+               g_now_us / 1e6);
       }
       if ((g_now_us / 1000) % 250 == 0) {
         query(check);
@@ -483,6 +489,9 @@ int main(int argc, char **argv) {
     n = 0; for (auto &c : s.arp_clients_) n += c.load() != 0;
     check(n == 8, "address 0 ignored");
   }
+
+  begin("Z. Counters across every scenario above");
+  check(!g_counter_underflow, "never accepted more pulses than edges seen (rejected_pulses can't underflow)");
 
   printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED", failures, failures == 1 ? "" : "s");
   return failures ? 1 : 0;
