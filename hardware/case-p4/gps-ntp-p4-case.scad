@@ -35,7 +35,7 @@ tail_h = 4.0;           // under the P4: solder tails and wire soldering room
 gps_lift = 3.0;         // GPS board off the floor: its own solder tails
 post_d = 6.0;  screw_d = 2.8;  head_d = 6.2;   // M3 self-tapping lid screws
 rib = 1.6;              // side ribs that locate the boards
-gap = 8.0;              // between the P4 strip and the GPS strip: the four wires and their slack
+gap = 12.0;             // between the P4 strip and the GPS strip: wire slack, and room for the lid-screw posts
 
 in_l = p4_l + rj45_protrude + usbc_protrude + 2 * clear;        // P4 spans the full length
 in_w = 2 * clear + p4_w + gap + gps_w + 2 * clear + 2 * rib;
@@ -50,7 +50,15 @@ gps_x = wall + in_l - clear - gps_l;   // against the +X (USB-C) wall, SMA throu
 gps_y = p4_y + p4_w + clear + gap + rib + clear;
 gps_z = floor_t + gps_lift;
 sma_y = sma_side == "outer" ? gps_y + gps_w - sma_edge : gps_y + sma_edge;
-post_xy = [[wall + 4, wall + 4], [out_l - wall - 4, wall + 4], [wall + 4, out_w - wall - 4], [out_l - wall - 4, out_w - wall - 4]];
+
+// Both boards run almost the full length and width of the case, so there is no free space at the
+// case's actual corners to put full-height lid-screw posts -- three of the four would land inside a
+// board's footprint. The one place that is clear of both boards *and* both their locating ribs is the
+// channel between the P4 strip and the GPS strip; put all four posts there, spread along the length.
+chan_y0 = p4_y + p4_w + clear + rib;   // top of the P4 rib
+chan_y1 = gps_y - clear - rib;         // bottom of the GPS rib
+chan_mid = (chan_y0 + chan_y1) / 2;
+post_xy = [[wall + 5, chan_mid], [wall + in_l / 3, chan_mid], [wall + 2 * in_l / 3, chan_mid], [out_l - wall - 5, chan_mid]];
 
 module rrect(l, w, r) offset(r = r) offset(delta = -r) square([l, w]);
 
