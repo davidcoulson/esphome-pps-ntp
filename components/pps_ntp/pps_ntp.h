@@ -44,7 +44,7 @@ bool parse_ntp_request_frame(const uint8_t *frame, uint32_t length, uint16_t por
 // Maps the local esp_timer clock (µs since boot) onto UTC, re-fitted on every accepted PPS pulse
 struct ClockModel {
   bool valid{false};
-  int64_t anchor_local_us{0};  // fitted local time of the most recent accepted pulse
+  double anchor_local_us{0};   // fitted local time of the most recent accepted pulse (sub-µs)
   int64_t anchor_utc_s{0};     // UTC (unix seconds) of that pulse
   double local_us_per_s{1e6};  // local microseconds per true second (crystal rate)
   int64_t last_pulse_local_us{0};  // raw local time of the most recent accepted pulse
@@ -87,6 +87,8 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void set_driver_rx_timestamp(bool on) { this->driver_rx_timestamp_.store(on, std::memory_order_relaxed); }
   void set_install_rx_hook(bool on) { this->install_rx_hook_requested_ = on; }
   void set_root_dispersion_us(double us) { this->root_dispersion_us_ = us; }
+  void set_rx_delay_us(double us) { this->rx_delay_us_ = us; }
+  void set_tx_delay_us(double us) { this->tx_delay_us_ = us; }
   void set_rx_reference_pin(int pin) { this->rx_reference_pin_ = pin; }
   void set_rx_timestamp_gain_sensor(sensor::Sensor *s) { this->rx_timestamp_gain_sensor_ = s; }
   void set_rx_interrupt_lead_sensor(sensor::Sensor *s) { this->rx_interrupt_lead_sensor_ = s; }
@@ -126,7 +128,8 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   uint32_t last_int_value_{0};
   // Ties the capture counter to esp_timer: the midpoint of two esp_timer reads around a software latch.
   // Called from the loop and from the Ethernet driver task, serialised by ref_lock_.
-  void sample_ref_(uint32_t *ticks, int64_t *us);
+  void sample_ref_(uint32_t *ticks, double *us);
+  double systimer_ticks_per_us_{16.0};  // esp_timer's counter rate, calibrated at setup
   void note_interrupt_lead_(int64_t hook_us);
   std::atomic<bool> rx_hook_active_{false};
   std::atomic<bool> driver_rx_timestamp_{true};
@@ -155,6 +158,8 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void refresh_arp_();
 
   double root_dispersion_us_{250.0};
+  double rx_delay_us_{0};  // wire arrival to receive stamp (measured), taken off T2
+  double tx_delay_us_{0};  // transmit stamp to wire departure (measured), added to T3
   int8_t precision_{-20};
   int rx_reference_pin_{-1};
 #ifdef USE_PPS_NTP_RAW_UDP
@@ -183,9 +188,9 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void service_baud_switch_();
 
   // Clock discipline
-  void handle_pulse_(int64_t local_us);
-  void accept_pulse_(int64_t local_us, int64_t utc_s);
-  void reset_discipline_(const char *reason);
+  void handle_pulse_(double local_us);
+  void accept_pulse_(double local_us, int64_t utc_s);
+  void reset_discipline_(const char *reason, bool keep_time);
   void log_status_();
   void publish_model_();
   ClockModel get_model_();
@@ -226,13 +231,13 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   uint8_t outliers_{0};
 
   int fit_window_{64};
-  double max_residual_us_{1000.0};
+  double max_residual_us_{200.0};
   char refid_[4]{'G', 'P', 'S', '\0'};  // NTP refid: up to 4 ASCII chars, zero-padded, not NUL-terminated
-  std::vector<int64_t> hist_local_;
+  std::vector<double> hist_local_;  // sub-µs pulse times from the hardware capture
   std::vector<int64_t> hist_utc_;
   int hist_count_{0};
   int hist_head_{0};  // index of the next write
-  int64_t last_accepted_local_us_{0};
+  double last_accepted_local_us_{0};
   int64_t last_accepted_utc_s_{0};
   double jitter_sq_us_{0};
   double last_residual_us_{0};
@@ -240,7 +245,9 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   // Diagnostics, reported by update()
   uint32_t edges_seen_{0};
   uint32_t pulses_accepted_{0};
-  int64_t last_counted_pulse_us_{-1};  // the edge pulses_accepted_ last counted
+  double last_counted_pulse_us_{-1};  // the edge pulses_accepted_ last counted
+  bool relocking_{false};    // history was reset but the old model still serves (holdover): no outlier test
+  bool ever_synced_{false};  // once true, a lost lock is answered with stratum 16 instead of silence
   uint32_t nmea_ok_{0};
   uint32_t nmea_bad_{0};
   uint32_t ubx_frames_{0};

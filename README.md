@@ -37,7 +37,7 @@ GNSS UART ─► NMEA RMC (which second) ┤
    - **ARP priming.** lwIP doesn't learn a client's MAC from its requests and forgets entries after 5 minutes, so a client polling every 17 minutes would otherwise find the cache cold every time and its reply — already stamped — would wait out an ARP round trip. The component re-ARPs its most recent IPv4 clients (or the gateway, for off-subnet ones) every 2 minutes.
    - **Synced:** stratum 1, refid `GPS` (configurable). The precision field is measured at boot from the system clock (normally 2^-19 s, the 1 µs `esp_timer` step). Root dispersion is `root_dispersion` (250 µs) plus 5 ppm of holdover drift.
    - **PPS lost:** keeps serving on the local crystal for `holdover` (stratum 1, with dispersion growing over time).
-   - **After holdover:** replies with LI=3 and stratum 16.
+   - **After holdover, or while re-locking after a phase step:** replies with LI=3 and stratum 16, so clients discard the time but don't time out. A gap in PPS alone keeps serving on holdover while the fit rebuilds.
    - **Never synced:** doesn't reply at all.
 
 The ESPHome main loop only handles parsing and the fit. Nothing time-critical depends on how often it runs.
@@ -64,7 +64,7 @@ Wiring (example config):
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.6.1
+  - source: github://davidcoulson/esphome-pps-ntp@v0.7.0
     components: [pps_ntp]
 
 uart:
@@ -105,7 +105,7 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 | `strong_signal_threshold` | `35` | The C/N0 in dB-Hz at which a satellite counts towards `strong_satellites`. |
 | `holdover` | `15min` | How long to keep serving stratum 1 after PPS or the fix is lost. |
 | `fit_window` | `64` | Pulses in the least-squares fit (8–256). Longer windows average out more noise; shorter ones track temperature changes in the crystal faster. |
-| `max_residual` | `1000us` | A pulse further than this from the model is an outlier; three in a row reset the fit. With hardware capture, about `50us` is a reasonable tighter setting once the node has proven stable. |
+| `max_residual` | `200us` | A pulse further than this from the model is an outlier; three in a row reset the fit. Measured hardware-capture jitter is under 1 µs, so `50us` is reasonable once the node has proven stable; the GPIO-interrupt fallback wants more headroom. |
 | `refid` | `GPS` | NTP reference ID sent to clients (1–4 ASCII characters, e.g. `PPS`). |
 | `stationary` | `true` | Sends `UBX-CFG-NAV5` at boot to put the receiver in its stationary dynamic model. A receiver that knows it cannot be moving constrains its solution, which steadies the time when signals are marginal — worth having on any fixed installation. |
 | `trim_nmea` | `false` | Sends `UBX-CFG-MSG` at boot to silence the NMEA sentences this component doesn't read, keeping RMC, GGA and GSV. Off by default because it changes what the receiver emits. |
@@ -113,6 +113,7 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 | `transport` | `socket` | `raw_lwip` is **experimental**: it has served a few thousand requests on an ESP32-S3-ETH without trouble, and cut the median round trip by about 0.45 ms and the tail by more (see Limitations), but it hasn't had a long soak. It answers from lwIP's tcpip thread instead of a socket task, which removes the socket mailbox and a task wake-up from the timestamp path. `task_core` can't be combined with it. |
 | `task_core` | auto | Pins the NTP task to core `0` or `1`. By default it runs on the core the ESPHome loop isn't using. Rejected at validation on single-core chips (C2/C3/C5/C6/C61/H2/S2) and on an ESP32 built with `CONFIG_FREERTOS_UNICORE`. A compile-time `#error` catches anything else that ends up single-core. |
 | `driver_rx_timestamp` | `true` | Ethernet only: stamp requests in the Ethernet driver rather than where the server reads them (see Serving). Can be flipped at runtime from a lambda, `id(ntp).set_driver_rx_timestamp(false)`, for A/B measurement; `rx_timestamp_gain` keeps reporting either way. |
+| `rx_delay` / `tx_delay` | `0us` | Measured fixed delays inside the node: wire arrival to receive stamp (taken off T2) and transmit stamp to wire departure (added to T3). Both need an external reference to measure, e.g. a second GPS-disciplined node on the same switch. |
 | `root_dispersion` | `250us` | Base root dispersion advertised to clients: the error bound that nothing on the node can measure (network asymmetry, the transmit path through the Ethernet chip). Holdover drift is added on top. |
 | `rx_reference_pin` | none | **Diagnostic**, SPI Ethernet only. The Ethernet chip's interrupt GPIO as a plain number (W5500 `INT`, `10` on the Waveshare ESP32-S3-ETH). A spare MCPWM capture channel timestamps its falling edge, which measures how long a frame took from the wire-side interrupt to the driver hook (`rx_interrupt_lead`). Doesn't change served time. |
 | `update_interval` | `60s` | How often the sensors publish. |
@@ -166,7 +167,7 @@ At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports wh
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.6.1
+  - source: github://davidcoulson/esphome-pps-ntp@v0.7.0
     components: [pps_ntp, gnss_sim]
 
 gnss_sim:

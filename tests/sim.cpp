@@ -330,14 +330,30 @@ int main(int argc, char **argv) {
     s.pps_on = false; s.fix = false; s.run(20 * 60, false);
     check(s.unsynced > 0, "drops to stratum 16 after the holdover expires");
     int before = s.served;
+    int silent_before = s.silent;
     s.pps_on = true; s.fix = true; s.run(30);
     check(s.served > before, "recovers when the receiver comes back");
+    check(s.silent == silent_before, "answers (stratum 16) rather than going silent while re-locking");
+  }
+
+  begin("J2. PPS gap of 11 minutes (longer than the 600 s relabel limit, shorter than the 15 min holdover)");
+  {
+    Sim s; s.setup(); s.run(60);
+    int unsynced_before = s.unsynced, silent_before = s.silent;
+    s.pps_on = false; s.fix = false; s.run(11 * 60, false);
+    s.pps_on = true; s.fix = true; s.run(30);
+    check(s.unsynced == unsynced_before && s.silent == silent_before, "kept serving stratum 1 on holdover through the re-lock");
+    check(std::fabs(s.worst_served_error_us) < 200, "held-over time stayed within 200 us");
+    s.run(30);
+    check(s.first_synced_s > 0 && s.served > 0, "locked again on the new pulses");
   }
 
   begin("K. PPS phase steps by 5 ms (receiver re-acquisition)");
   {
     Sim s; s.setup(); s.run(60);
+    int silent_before = s.silent, unsynced_before = s.unsynced;
     s.phase_offset_us = 5000; s.run(10, false);
+    check(s.silent == silent_before && s.unsynced > unsynced_before, "a phase step drops to stratum 16, not silence");
     s.worst_served_error_us = 0; s.run(60);
     check(std::fabs(s.worst_served_error_us) < 50, "re-disciplines to the new phase within 10 s");
   }
@@ -464,7 +480,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 20; i++) { uint8_t other[RX_KEY_LEN] = {static_cast<uint8_t>(i)}; s.rx_record_(other, g_now_us); }
     check(s.rx_ring_[0].seq.load() % 2 == 0, "ring slots settle on even sequence numbers");
 
-    check(static_cast<int8_t>(rep[3]) == -19, "precision measured from the clock (1 us step = 2^-19 s)");
+    check(static_cast<int8_t>(rep[3]) == -20, "precision measured from the clock (1 us step = 2^-20 s)");
     uint32_t disp = (rep[8] << 24) | (rep[9] << 16) | (rep[10] << 8) | rep[11];
     check(disp >= 16 && disp <= 17, "root dispersion defaults to 250 us (+ drift since the last pulse)");
     Sim d; d.set_root_dispersion_us(1000); d.setup(); d.run(30);

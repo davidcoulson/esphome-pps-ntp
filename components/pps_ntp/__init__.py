@@ -53,6 +53,8 @@ CONF_TRIM_NMEA = "trim_nmea"
 CONF_TRANSPORT = "transport"
 CONF_DRIVER_RX_TIMESTAMP = "driver_rx_timestamp"
 CONF_ROOT_DISPERSION = "root_dispersion"
+CONF_RX_DELAY = "rx_delay"
+CONF_TX_DELAY = "tx_delay"
 CONF_RX_REFERENCE_PIN = "rx_reference_pin"
 CONF_RX_TIMESTAMP_GAIN = "rx_timestamp_gain"
 CONF_RX_INTERRUPT_LEAD = "rx_interrupt_lead"
@@ -100,7 +102,7 @@ CONFIG_SCHEMA = cv.All(
             # Pulses in the least-squares fit: longer is quieter, shorter tracks temperature faster
             cv.Optional(CONF_FIT_WINDOW, default=64): cv.int_range(min=8, max=256),
             # A pulse further than this from the model is an outlier (3 in a row reset the fit)
-            cv.Optional(CONF_MAX_RESIDUAL, default="1000us"): cv.All(
+            cv.Optional(CONF_MAX_RESIDUAL, default="200us"): cv.All(
                 cv.positive_time_period_microseconds,
                 cv.Range(min=cv.TimePeriod(microseconds=10)),
             ),
@@ -127,6 +129,15 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ROOT_DISPERSION, default="250us"): cv.All(
                 cv.positive_time_period_microseconds,
                 cv.Range(min=cv.TimePeriod(microseconds=1), max=cv.TimePeriod(seconds=1)),
+            ),
+            # Measured fixed delays in the node's own network path (defaults: none). rx_delay: from the frame
+            # arriving on the wire to the receive stamp (rx_interrupt_lead shows part of it). tx_delay: from
+            # the transmit stamp to the frame leaving. Both need an external reference to measure.
+            cv.Optional(CONF_RX_DELAY, default="0us"): cv.All(
+                cv.positive_time_period_microseconds, cv.Range(max=cv.TimePeriod(milliseconds=5))
+            ),
+            cv.Optional(CONF_TX_DELAY, default="0us"): cv.All(
+                cv.positive_time_period_microseconds, cv.Range(max=cv.TimePeriod(milliseconds=5))
             ),
             # DIAGNOSTIC: the SPI Ethernet chip's interrupt GPIO (W5500 INT; GPIO10 on the Waveshare S3-ETH).
             # A spare MCPWM capture channel timestamps its falling edge, measuring the receive delay the
@@ -328,6 +339,8 @@ async def to_code(config):
     )
     if CONF_RX_REFERENCE_PIN in config:
         cg.add(var.set_rx_reference_pin(config[CONF_RX_REFERENCE_PIN]))
+    cg.add(var.set_rx_delay_us(config[CONF_RX_DELAY].total_microseconds))
+    cg.add(var.set_tx_delay_us(config[CONF_TX_DELAY].total_microseconds))
     if config[CONF_TRANSPORT] == TRANSPORT_RAW_LWIP:
         cg.add_define("USE_PPS_NTP_RAW_UDP")
     if CONF_TASK_CORE in config:

@@ -8,6 +8,11 @@
 #include <sdkconfig.h>
 #include <esp_attr.h>
 #include <esp_timer.h>
+
+#ifdef USE_PPS_NTP_MCPWM
+// esp_timer's own counter, before its divide down to microseconds: 16 ticks/µs on the S3 and P4
+extern "C" uint64_t esp_timer_impl_get_counter_reg(void);
+#endif
 #include <lwip/sockets.h>
 #include <unistd.h>
 
@@ -146,7 +151,7 @@ static int64_t internal_to_utc_us(const ClockModel &model, int64_t internal_us) 
 }
 
 static int64_t internal_us_at(const ClockModel &model, int64_t local_us) {
-  double elapsed = static_cast<double>(local_us - model.anchor_local_us) * (1e6 / model.local_us_per_s);
+  double elapsed = (static_cast<double>(local_us) - model.anchor_local_us) * (1e6 / model.local_us_per_s);
   return model.anchor_utc_s * 1000000LL + llround(elapsed);
 }
 
@@ -181,6 +186,18 @@ void PPSNTPServer::setup() {
   // Always apply the YAML pin mode (pull-up/down); MCPWM only routes the pad to its capture input
   this->pps_pin_->setup();
   this->hw_capture_ = this->setup_capture_();
+#ifdef USE_PPS_NTP_MCPWM
+  if (this->hw_capture_) {
+    // Ratio of esp_timer's raw counter to its microseconds (an exact integer): lets the reference latch
+    // be placed to a fraction of a microsecond instead of the ±0.5 µs of a whole-µs read
+    uint64_t raw0 = esp_timer_impl_get_counter_reg();
+    int64_t us0 = esp_timer_get_time();
+    delay(20);
+    uint64_t raw1 = esp_timer_impl_get_counter_reg();
+    int64_t us1 = esp_timer_get_time();
+    this->systimer_ticks_per_us_ = std::round(static_cast<double>(raw1 - raw0) / static_cast<double>(us1 - us0));
+  }
+#endif
   if (!this->hw_capture_)
     this->pps_pin_->attach_interrupt(PPSNTPServer::pps_isr, this, gpio::INTERRUPT_RISING_EDGE);
 
@@ -373,28 +390,28 @@ void PPSNTPServer::poll_capture_() {
   this->last_cap_value_ = pulse_ticks;
 
   uint32_t ref_ticks;
-  int64_t ref_us;
+  double ref_us;
   this->sample_ref_(&ref_ticks, &ref_us);
 
   // The 32-bit counter wraps every ~53 s (80 MHz); the signed difference is valid for ~26 s
   int32_t ticks_since_edge = static_cast<int32_t>(ref_ticks - pulse_ticks);
-  double edge_us = ref_us - ticks_since_edge / this->cap_ticks_per_us_;
-  this->handle_pulse_(llround(edge_us));
+  this->handle_pulse_(ref_us - ticks_since_edge / this->cap_ticks_per_us_);
 #endif
 }
 
-void PPSNTPServer::sample_ref_(uint32_t *ticks, int64_t *us) {
+void PPSNTPServer::sample_ref_(uint32_t *ticks, double *us) {
 #ifdef USE_PPS_NTP_MCPWM
-  // Latch the capture timer "now" between two esp_timer reads, with nothing able to preempt us, to
-  // place captured edges on the esp_timer timeline. The lock also keeps the loop and the Ethernet
-  // driver task from latching over each other's reading.
+  // Latch the capture timer "now" between two reads of esp_timer's raw counter, with nothing able to
+  // preempt us, to place captured edges on the esp_timer timeline. The raw counter (16 MHz) places the
+  // latch to ~60 ns; esp_timer_get_time() would round each read to a whole microsecond. The lock also
+  // keeps the loop and the Ethernet driver task from latching over each other's reading.
   portENTER_CRITICAL(&this->ref_lock_);
-  int64_t before_us = esp_timer_get_time();
+  uint64_t before = esp_timer_impl_get_counter_reg();
   mcpwm_capture_channel_trigger_soft_catch(this->cap_ref_);
-  int64_t after_us = esp_timer_get_time();
+  uint64_t after = esp_timer_impl_get_counter_reg();
   mcpwm_capture_get_latched_value(this->cap_ref_, ticks);
   portEXIT_CRITICAL(&this->ref_lock_);
-  *us = (before_us + after_us) / 2;
+  *us = static_cast<double>(before + after) * 0.5 / this->systimer_ticks_per_us_;
 #endif
 }
 
@@ -411,7 +428,7 @@ void PPSNTPServer::note_interrupt_lead_(int64_t hook_us) {
     return;  // no new edge: the line was already low for an earlier frame
   this->last_int_value_ = int_ticks;
   uint32_t ref_ticks;
-  int64_t ref_us;
+  double ref_us;
   this->sample_ref_(&ref_ticks, &ref_us);
   double edge_us = ref_us - static_cast<int32_t>(ref_ticks - int_ticks) / this->cap_ticks_per_us_;
   double lead = static_cast<double>(hook_us) - edge_us;
@@ -437,7 +454,7 @@ void PPSNTPServer::poll_isr_() {
 }
 
 // RFC 5905 precision: log2 of the time it takes to read the clock, taken as the smallest step between two
-// consecutive reads that differ (esp_timer counts whole microseconds, so this is normally 2^-19 s)
+// consecutive reads that differ (esp_timer counts whole microseconds, so this is normally 2^-20 s)
 void PPSNTPServer::measure_precision_() {
   int64_t smallest = INT64_MAX;
   int64_t previous = esp_timer_get_time();
@@ -449,7 +466,7 @@ void PPSNTPServer::measure_precision_() {
   }
   if (smallest == INT64_MAX)
     smallest = 1;
-  this->precision_ = static_cast<int8_t>(std::ceil(std::log2(static_cast<double>(smallest) * 1e-6)));
+  this->precision_ = static_cast<int8_t>(std::floor(std::log2(static_cast<double>(smallest) * 1e-6)));
 }
 
 void PPSNTPServer::update() {
@@ -550,11 +567,12 @@ void PPSNTPServer::dump_config() {
                 "  Refid: %.4s\n"
                 "  Require UTC valid: %s\n"
                 "  Root dispersion: %.0f µs\n"
+                "  Rx/Tx delay compensation: %.0f / %.0f µs\n"
                 "  Precision: 2^%d s",
                 this->port_, static_cast<unsigned>(this->holdover_us_ / 1000000), this->fit_window_,
                 this->max_residual_us_, this->strong_threshold_, YESNO(this->stationary_),
                 YESNO(this->trim_nmea_), this->refid_, YESNO(this->require_utc_valid_), this->root_dispersion_us_,
-                this->precision_);
+                this->rx_delay_us_, this->tx_delay_us_, this->precision_);
 #ifdef USE_ETHERNET
   if (!this->install_rx_hook_requested_) {
     ESP_LOGCONFIG(TAG, "  Receive timestamp: network stack (driver hook disabled)");
@@ -607,7 +625,7 @@ void PPSNTPServer::dump_config() {
 // ---------------------------------------------------------------------------
 // Clock discipline
 
-void PPSNTPServer::handle_pulse_(int64_t local_us) {
+void PPSNTPServer::handle_pulse_(double local_us) {
   this->edges_seen_++;
 
   // Without a fix the receiver's pulse is free-running; hold over on the local crystal instead
@@ -615,18 +633,18 @@ void PPSNTPServer::handle_pulse_(int64_t local_us) {
   if (this->hist_count_ > 0 && fix_recent) {
     // Label by counting whole seconds since the last accepted pulse
     double rate = this->model_.valid ? this->model_.local_us_per_s : 1e6;
-    int64_t elapsed = local_us - this->last_accepted_local_us_;
+    double elapsed = local_us - this->last_accepted_local_us_;
     int64_t seconds = llround(elapsed / rate);
     if (seconds < 1)
       return;  // glitch just after a pulse: leave the recorded pulse alone so its RMC still finds it
     if (seconds > MAX_PULSE_GAP_S) {
-      this->reset_discipline_("PPS gap too long");
+      this->reset_discipline_("PPS gap too long", true);  // the model is only as stale as its holdover
     } else {
-      double error = static_cast<double>(elapsed) - seconds * rate;
-      double tolerance = 300.0 + 100e-6 * static_cast<double>(elapsed);
+      double error = elapsed - seconds * rate;
+      double tolerance = 300.0 + 100e-6 * elapsed;
       if (std::fabs(error) <= tolerance) {
         this->off_second_edges_ = 0;
-        this->last_pulse_us_ = local_us;
+        this->last_pulse_us_ = llround(local_us);
         this->last_pulse_utc_s_ = this->last_accepted_utc_s_ + seconds;
         this->last_pulse_labelled_ = true;
         this->accept_pulse_(local_us, this->last_pulse_utc_s_);
@@ -637,29 +655,30 @@ void PPSNTPServer::handle_pulse_(int64_t local_us) {
         ESP_LOGD(TAG, "Ignoring PPS edge %.0f us off the second", error);
         return;
       }
-      this->reset_discipline_("PPS no longer on the second");
+      this->reset_discipline_("PPS no longer on the second", false);
     }
   }
 
   // Candidate: the next valid RMC labels it
-  this->last_pulse_us_ = local_us;
+  this->last_pulse_us_ = llround(local_us);
   this->last_pulse_labelled_ = false;
 }
 
-void PPSNTPServer::accept_pulse_(int64_t local_us, int64_t utc_s) {
+void PPSNTPServer::accept_pulse_(double local_us, int64_t utc_s) {
   if (this->hist_count_ > 0 && utc_s <= this->last_accepted_utc_s_)
-    this->reset_discipline_("GNSS time went backwards");
+    this->reset_discipline_("GNSS time went backwards", false);
 
-  if (this->model_.valid) {
+  // While re-locking on a held-over model the new pulses are the truth, not the model
+  if (this->model_.valid && !this->relocking_) {
     double predicted = this->model_.anchor_local_us + (utc_s - this->model_.anchor_utc_s) * this->model_.local_us_per_s;
-    double residual = static_cast<double>(local_us) - predicted;
+    double residual = local_us - predicted;
     this->last_residual_us_ = residual;
     if (std::fabs(residual) > this->max_residual_us_) {
       if (++this->outliers_ < 3) {
         ESP_LOGW(TAG, "PPS pulse %.0f µs from prediction; ignoring", residual);
         return;
       }
-      this->reset_discipline_("PPS phase stepped");
+      this->reset_discipline_("PPS phase stepped", false);
     } else {
       this->outliers_ = 0;
       this->jitter_sq_us_ = this->hist_count_ < 8 ? residual * residual
@@ -687,21 +706,21 @@ void PPSNTPServer::accept_pulse_(int64_t local_us, int64_t utc_s) {
     double sum_x = 0, sum_y = 0;
     for (int i = 0; i < this->hist_count_; i++) {
       sum_x += static_cast<double>(this->hist_utc_[i] - utc_s);
-      sum_y += static_cast<double>(this->hist_local_[i] - local_us);
+      sum_y += this->hist_local_[i] - local_us;
     }
     double mean_x = sum_x / this->hist_count_;
     double mean_y = sum_y / this->hist_count_;
     double sxx = 0, sxy = 0;
     for (int i = 0; i < this->hist_count_; i++) {
       double dx = static_cast<double>(this->hist_utc_[i] - utc_s) - mean_x;
-      double dy = static_cast<double>(this->hist_local_[i] - local_us) - mean_y;
+      double dy = (this->hist_local_[i] - local_us) - mean_y;
       sxx += dx * dx;
       sxy += dx * dy;
     }
     rate = sxy / sxx;
     fitted_offset = mean_y - rate * mean_x;
     if (std::fabs(rate - 1e6) > MAX_RATE_ERROR_PPM) {
-      this->reset_discipline_("implausible crystal rate");
+      this->reset_discipline_("implausible crystal rate", false);
       return;
     }
   }
@@ -710,19 +729,28 @@ void PPSNTPServer::accept_pulse_(int64_t local_us, int64_t utc_s) {
   // The first label comes from a single RMC, which a stalled loop can pair with the wrong pulse (off by a
   // whole second). Don't serve until later RMCs have independently agreed with the pulse count.
   next.valid = this->hist_count_ >= MIN_PULSES_FOR_SYNC && this->label_confirmations_ >= MIN_LABEL_CONFIRMATIONS;
-  next.anchor_local_us = local_us + llround(fitted_offset);
+  // Not locked yet, but a held-over model is still serving: leave it until the new fit is ready
+  if (!next.valid && this->relocking_)
+    return;
+  this->relocking_ = false;
+  next.anchor_local_us = local_us + fitted_offset;
   next.anchor_utc_s = utc_s;
   next.local_us_per_s = rate;
-  next.last_pulse_local_us = local_us;
+  next.last_pulse_local_us = llround(local_us);
   next.utc_trusted = this->utc_trusted_;
   this->fill_leap_(next);
+  if (next.valid && next.utc_trusted)
+    this->ever_synced_ = true;
   portENTER_CRITICAL(&this->lock_);
   this->model_ = next;
   portEXIT_CRITICAL(&this->lock_);
 }
 
-void PPSNTPServer::reset_discipline_(const char *reason) {
-  ESP_LOGW(TAG, "Resetting clock discipline: %s", reason);
+// keep_time: the old model's time is still trustworthy (it just has no fresh pulses), so it keeps
+// serving in holdover while the fit rebuilds. Otherwise the model is dropped and, if the server had
+// ever been synchronised, clients get stratum 16 rather than silence until the new fit is ready.
+void PPSNTPServer::reset_discipline_(const char *reason, bool keep_time) {
+  ESP_LOGW(TAG, "Resetting clock discipline: %s%s", reason, keep_time ? " (serving on holdover meanwhile)" : "");
   this->hist_count_ = 0;
   this->hist_head_ = 0;
   this->outliers_ = 0;
@@ -732,9 +760,12 @@ void PPSNTPServer::reset_discipline_(const char *reason) {
   this->jitter_sq_us_ = 0;
   if (this->leap_change_ == 0)
     this->leap_adj_s_ = 0;  // no history left that was labelled with it
-  portENTER_CRITICAL(&this->lock_);
-  this->model_.valid = false;
-  portEXIT_CRITICAL(&this->lock_);
+  this->relocking_ = keep_time && this->model_.valid;
+  if (!this->relocking_) {
+    portENTER_CRITICAL(&this->lock_);
+    this->model_.valid = false;
+    portEXIT_CRITICAL(&this->lock_);
+  }
 }
 
 void PPSNTPServer::fill_leap_(ClockModel &model) const {
@@ -945,7 +976,7 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
     }
     if (++this->label_mismatches_ < 3)
       return;
-    this->reset_discipline_("NMEA time disagrees with PPS count");
+    this->reset_discipline_("NMEA time disagrees with PPS count", false);
   }
 
   ESP_LOGD(TAG, "Labelling the pulse from %lld ms ago as unix %lld (from RMC)", static_cast<long long>(age / 1000),
@@ -1184,9 +1215,12 @@ bool PPSNTPServer::build_reply_(const uint8_t *request, int64_t rx_local_us, uin
   rx_local_us = this->choose_rx_stamp_(request, src_port, rx_local_us);
 
   ClockModel model = this->get_model_();
-  if (!model.valid)
+  if (!model.valid && !this->ever_synced_)
     return false;  // never synchronised: stay silent rather than hand out a bogus time
-  bool synced = this->is_synced_(model, rx_local_us);
+  // Lost lock after having been synchronised: answer with stratum 16 (clients discard the time but
+  // don't time out) using the last model, until the new fit is ready
+  bool synced = model.valid && this->is_synced_(model, rx_local_us);
+  rx_local_us -= llround(this->rx_delay_us_);  // the stamp is taken this long after the frame arrived
   double age_s = static_cast<double>(rx_local_us - model.last_pulse_local_us) / 1e6;
   // The base covers what no local measurement can see: network asymmetry and the receive/transmit paths
   double dispersion_us = this->root_dispersion_us_ + HOLDOVER_DRIFT_PPM * age_s;
@@ -1208,7 +1242,8 @@ bool PPSNTPServer::build_reply_(const uint8_t *request, int64_t rx_local_us, uin
   put_ntp_timestamp(reply + 16, internal_to_utc_us(model, model.anchor_utc_s * 1000000LL));
   memcpy(reply + 24, request + 40, 8);  // originate = client's transmit
   put_ntp_timestamp(reply + 32, utc_us_at(model, rx_local_us));
-  put_ntp_timestamp(reply + 40, utc_us_at(model, esp_timer_get_time()));  // last: as close to the send as we get
+  // Last, as close to the send as we get; tx_delay is the measured path from here to the wire
+  put_ntp_timestamp(reply + 40, utc_us_at(model, esp_timer_get_time() + llround(this->tx_delay_us_)));
   this->requests_++;
   return true;
 }

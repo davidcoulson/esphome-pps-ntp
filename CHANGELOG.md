@@ -4,6 +4,13 @@ Hardware status: run on an ESP32-S3-ETH against the `gnss_sim` emulator. Not yet
 
 ## Unreleased
 
+## v0.7.0 - 2026-09-23
+- A lost lock no longer silences the server. A PPS gap keeps serving stratum 1 on the held-over model while the fit rebuilds (it was only ever as stale as its holdover); a phase step, rate error or NMEA disagreement answers with stratum 16 (LI=3) until the new fit is ready, so clients see a reply instead of a timeout. Silence is now only for a node that has never synchronised.
+- `rx_delay` / `tx_delay`: measured fixed delays in the node's network path, taken off T2 and added to T3. Default 0.
+- The reference latch reads esp_timer's raw 16 MHz counter instead of whole microseconds, placing each PPS edge to ~60 ns instead of ±0.5 µs. Pulse times and the fit are sub-microsecond throughout; NTP timestamps are still whole µs.
+- Precision is reported as 2^-20 (the nearest power of two at or below the 1 µs clock step) rather than 2^-19.
+- `max_residual` default 200 µs (was 1000): with hardware capture jitter under 1 µs, a bad pulse is caught five times sooner.
+
 ## v0.6.1 - 2026-09-21
 - Fix: `rejected_pulses` could underflow to 4294967295 (shown as 4294967296). When three RMCs disagreed with the pulse count, the fit reset and the same pulse was re-labelled and counted as accepted twice. Each edge is now counted at most once. Served time was never affected. Seen on hardware (weak-signal cold start); a sim check now runs across every scenario.
 
