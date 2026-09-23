@@ -10,7 +10,7 @@ part = "assembly";
 // The SMA sits 2.35 mm from one long edge of the GPS board. With the module in its cradle (SMA
 // towards the USB-C end, ceramic up), is the connector on the edge nearest the P4 ("inner") or the
 // edge nearest the case wall ("outer")? Both STLs are exported; print the one that matches.
-sma_side = "outer";
+sma_side = "inner";   // confirmed on the real module
 
 /* ---------------- boards (measured) ---------------- */
 p4_l = 78.0;    p4_w = 21.0;    p4_pcb = 1.6;
