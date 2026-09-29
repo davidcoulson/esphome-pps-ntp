@@ -49,6 +49,12 @@ jobs:
             echo "expected a validation error"; exit 1
           fi
           grep -q "rx_reference_pin needs MCPWM hardware capture" out.txt
+      - name: rx_reference_pin on ESP-IDF 5.5 is rejected
+        run: |
+          if esphome config tests/ci/invalid-rx-reference-idf55.yaml > out.txt 2>&1; then
+            echo "expected a validation error"; exit 1
+          fi
+          grep -q "ESP-IDF 6.0.0 or newer" out.txt
 
   compile:
     name: Compile ${{ matrix.config }}
@@ -74,6 +80,9 @@ jobs:
           key: toolchains-${{ matrix.config }}-${{ hashFiles('tests/ci/*.yaml') }}
           restore-keys: toolchains-${{ matrix.config }}-
       - name: Compile
+        # An explicit bash shell runs with -o pipefail, so a failed compile fails the step. Without it
+        # the exit status was tee's, and failed builds showed green.
+        shell: bash
         run: esphome compile tests/ci/${{ matrix.config }}.yaml 2>&1 | tee build.log
       - name: No warnings from this repo's components
         run: |

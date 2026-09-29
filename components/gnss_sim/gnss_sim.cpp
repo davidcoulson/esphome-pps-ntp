@@ -9,7 +9,16 @@
 #include <driver/gpio.h>
 #include <driver/uart.h>
 #include <esp_rom_gpio.h>
+#include <esp_idf_version.h>
+// ESP-IDF 6 moved the UART signal table from soc/ to the esp_hal_uart component
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
 #include <hal/uart_periph.h>
+#else
+#include <soc/uart_periph.h>
+// ...and renamed the pin indices
+#define SOC_UART_PERIPH_SIGNAL_TX SOC_UART_TX_PIN_IDX
+#define SOC_UART_PERIPH_SIGNAL_RX SOC_UART_RX_PIN_IDX
+#endif
 
 #include "esphome/core/log.h"
 

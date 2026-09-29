@@ -1,4 +1,5 @@
-# ESP32-S3 + W5500: MCPWM capture, socket transport, every option set
+# ESP32-S3 + W5500: MCPWM capture, socket transport, every option set. IDF 6.0+ because MCPWM
+# capture (and so rx_reference_pin) needs it.
 esphome:
   name: ci-s3-socket
 esp32:
@@ -6,6 +7,7 @@ esp32:
   flash_size: 16MB
   framework:
     type: esp-idf
+    version: 6.1.0
 external_components:
   - source:
       type: local

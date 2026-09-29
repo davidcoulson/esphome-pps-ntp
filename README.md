@@ -100,7 +100,7 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 | `uart_id` | — | UART connected to the receiver. Needs both RX and TX, because the component sends UBX commands. |
 | `pps_pin` | **required** | GPIO connected to the receiver's PPS output. The pin's `mode` (pull-up or pull-down) and `inverted: true` (active-low PPS) apply in both capture modes. |
 | `port` | `123` | UDP port to listen on. |
-| `hardware_capture` | `true` | Timestamp PPS with the MCPWM capture unit where the chip has one. Set to `false` to force the GPIO interrupt. |
+| `hardware_capture` | `true` | Timestamp PPS with the MCPWM capture unit where the chip has one. Needs ESP-IDF 6.0 or newer; older frameworks fall back to the GPIO interrupt with a compile-time warning. Set to `false` to force the GPIO interrupt. |
 | `gnss_baud_rate` | none | If set, the component first listens at this rate for 1.5 s (the receiver keeps its setting across ESP reboots). Only if that stays quiet does it send the legacy `UBX-CFG-PRT` command at the UART's configured rate, verify the switch, save it with `UBX-CFG-CFG`, and fall back to the original rate if the switch fails. Useful for NEO-6M/7M/M8 modules stuck at 9600. |
 | `strong_signal_threshold` | `35` | The C/N0 in dB-Hz at which a satellite counts towards `strong_satellites`. |
 | `holdover` | `15min` | How long to keep serving stratum 1 after PPS or the fix is lost. |
@@ -115,7 +115,7 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 | `driver_rx_timestamp` | `true` | Ethernet only: stamp requests in the Ethernet driver rather than where the server reads them (see Serving). Can be flipped at runtime from a lambda, `id(ntp).set_driver_rx_timestamp(false)`, for A/B measurement; `rx_timestamp_gain` keeps reporting either way. |
 | `rx_delay` / `tx_delay` | `0us` | Measured fixed delays inside the node: wire arrival to receive stamp (taken off T2) and transmit stamp to wire departure (added to T3). Both need an external reference to measure, e.g. a second GPS-disciplined node on the same switch. |
 | `root_dispersion` | `250us` | Base root dispersion advertised to clients: the error bound that nothing on the node can measure (network asymmetry, the transmit path through the Ethernet chip). Holdover drift is added on top. |
-| `rx_reference_pin` | none | **Diagnostic**, SPI Ethernet only. The Ethernet chip's interrupt GPIO as a plain number (W5500 `INT`, `10` on the Waveshare ESP32-S3-ETH). A spare MCPWM capture channel timestamps its falling edge, which measures how long a frame took from the wire-side interrupt to the driver hook (`rx_interrupt_lead`). Doesn't change served time. |
+| `rx_reference_pin` | none | **Diagnostic**, SPI Ethernet only. The Ethernet chip's interrupt GPIO as a plain number (W5500 `INT`, `10` on the Waveshare ESP32-S3-ETH). A spare MCPWM capture channel (so ESP-IDF 6.0 or newer) timestamps its falling edge, which measures how long a frame took from the wire-side interrupt to the driver hook (`rx_interrupt_lead`). Doesn't change served time. |
 | `update_interval` | `60s` | How often the sensors publish. |
 
 ### Sensors

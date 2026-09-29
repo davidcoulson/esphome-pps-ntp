@@ -1,3 +1,5 @@
+import logging
+
 import esphome.codegen as cg
 from esphome import pins
 from esphome.components import binary_sensor, esp32, sensor, uart
@@ -314,6 +316,22 @@ def _final_validate_task_core(config):
     return config
 
 
+# The capture path reads the latched counter with mcpwm_capture_get_latched_value(), which ESP-IDF
+# only has from 6.0 on. Older frameworks fall back to the GPIO interrupt.
+MCPWM_MIN_IDF = cv.Version(6, 0, 0)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _uses_mcpwm_capture(config) -> bool:
+    """True when this build timestamps PPS with the MCPWM capture unit."""
+    return (
+        config[CONF_HARDWARE_CAPTURE]
+        and esp32.get_esp32_variant() in MCPWM_VARIANTS
+        and esp32.idf_version() >= MCPWM_MIN_IDF
+    )
+
+
 def _final_validate_rx_reference(config):
     if CONF_RX_INTERRUPT_LEAD in config and CONF_RX_REFERENCE_PIN not in config:
         raise cv.Invalid(
@@ -321,12 +339,11 @@ def _final_validate_rx_reference(config):
         )
     if CONF_RX_REFERENCE_PIN not in config:
         return config
-    if (
-        not config[CONF_HARDWARE_CAPTURE]
-        or esp32.get_esp32_variant() not in MCPWM_VARIANTS
-    ):
+    if not _uses_mcpwm_capture(config):
         raise cv.Invalid(
-            "rx_reference_pin needs MCPWM hardware capture", path=[CONF_RX_REFERENCE_PIN]
+            "rx_reference_pin needs MCPWM hardware capture, which needs a chip with MCPWM "
+            f"and ESP-IDF {MCPWM_MIN_IDF} or newer",
+            path=[CONF_RX_REFERENCE_PIN],
         )
     if "ethernet" not in fv.full_config.get():
         raise cv.Invalid(
@@ -350,9 +367,17 @@ async def to_code(config):
 
     pin = await cg.gpio_pin_expression(config[CONF_PPS_PIN])
     cg.add(var.set_pps_pin(pin))
-    if config[CONF_HARDWARE_CAPTURE] and esp32.get_esp32_variant() in MCPWM_VARIANTS:
+    if _uses_mcpwm_capture(config):
         esp32.include_builtin_idf_component("esp_driver_mcpwm")
         cg.add_define("USE_PPS_NTP_MCPWM")
+    elif config[CONF_HARDWARE_CAPTURE] and esp32.get_esp32_variant() in MCPWM_VARIANTS:
+        _LOGGER.warning(
+            "pps_ntp: MCPWM hardware capture needs ESP-IDF %s or newer (this build uses %s); "
+            "timestamping PPS with the GPIO interrupt instead. Set hardware_capture: false "
+            "to silence this.",
+            MCPWM_MIN_IDF,
+            esp32.idf_version(),
+        )
     cg.add(var.set_port(config[CONF_PORT]))
     cg.add(var.set_holdover_s(config[CONF_HOLDOVER].total_seconds))
     cg.add(var.set_fit_window(config[CONF_FIT_WINDOW]))

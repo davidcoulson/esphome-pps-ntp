@@ -4,6 +4,11 @@ Hardware status: run on an ESP32-S3-ETH against the `gnss_sim` emulator. Not yet
 
 ## Unreleased
 
+## v0.8.1 - 2026-09-29
+- MCPWM hardware capture now needs ESP-IDF 6.0 or newer, which is where `mcpwm_capture_get_latched_value()` first appears. On an older framework the component falls back to the GPIO interrupt with a compile-time warning instead of failing to build, and `rx_reference_pin` is rejected with a clear message. Builds on IDF 6.x are unchanged. Every release since v0.7.0 failed to compile on IDF 5.5.
+- `gnss_sim` builds on IDF 5.5 again (the UART signal table moved between 5.5 and 6.0).
+- CI: the compile step now fails when the build fails. It piped through `tee` without `pipefail`, so failed builds showed green. That is how the two problems above went unnoticed.
+
 ## v0.8.0 - 2026-09-29
 - New `latitude`, `longitude` and `altitude` sensors: the receiver's position from the GGA sentences the component already reads, published as the mean of each update interval's fixes. Fixes with GGA quality 0 are ignored, since receivers keep repeating their last position after losing the fix. No extra serial traffic, and nothing changes when the sensors aren't configured.
 
