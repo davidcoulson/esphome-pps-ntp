@@ -1,2 +1,2 @@
 #pragma once
-namespace esphome::sensor { struct Sensor { float state{0}; void publish_state(float v) { state = v; } }; }
+namespace esphome::sensor { struct Sensor { float state{0}; int publishes{0}; void publish_state(float v) { state = v; publishes++; } }; }

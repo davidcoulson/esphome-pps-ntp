@@ -45,6 +45,9 @@ pps_ntp:
   trim_nmea: true
   strong_satellites: {name: Strong Satellites}
   hdop: {name: HDOP}
+  latitude: {name: Latitude}
+  longitude: {name: Longitude}
+  altitude: {name: Altitude}
   rejected_pulses: {name: Rejected Pulses}
   nmea_errors: {name: NMEA Errors}
   pulse_age: {name: Pulse Age}

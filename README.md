@@ -129,6 +129,8 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 | `requests` | sensor | NTP requests served since boot. |
 | `strong_satellites` | sensor | How many tracked satellites are at or above `strong_signal_threshold` (default 35 dB-Hz). Often a better guide than the mean when choosing a spot: the mean is dragged down by marginal satellites, while this counts the ones actually carrying the fix. |
 | `hdop` | sensor | Horizontal dilution of precision, from GGA. Satellite geometry — the other half of fix quality. Below 2 is good, above 5 is poor. |
+| `latitude` / `longitude` | sensor (°) | The receiver's position from GGA, as the mean of every fix in the update interval: a stationary receiver's position wanders by metres from one second to the next. An interval without a fix publishes nothing. Six decimal places is about 0.1 m, though ESPHome sends sensor values as 32-bit floats, which limits them to about half a metre. |
+| `altitude` | sensor (m) | Height above mean sea level from GGA, averaged the same way. Vertical error is typically two to three times the horizontal. |
 | `rejected_pulses` | sensor | PPS edges seen but not used: line noise, or pulses arriving without a fix. |
 | `nmea_errors` | sensor | NMEA sentences that failed their checksum. A rising count means a marginal serial link, usually the wrong baud or a long unshielded wire. |
 | `pulse_age` | sensor (s) | Seconds since the last accepted pulse, so brief dropouts show up in history even when it re-locks before the next update. |

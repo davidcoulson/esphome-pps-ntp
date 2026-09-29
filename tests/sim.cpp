@@ -26,6 +26,7 @@ struct Sim : PPSNTPServer {
   InternalGPIOPin pin;
   sensor::Sensor sats;
   sensor::Sensor cno, strong, hdop, rejected, nmea_err, pulse_age;
+  sensor::Sensor latitude, longitude, altitude;
   bool tracking = true;  // false: satellites in view but none tracked (e.g. antenna unplugged)
   std::mt19937 rng{42};
 
@@ -64,6 +65,9 @@ struct Sim : PPSNTPServer {
     this->set_rejected_pulses_sensor(&rejected);
     this->set_nmea_errors_sensor(&nmea_err);
     this->set_pulse_age_sensor(&pulse_age);
+    this->set_latitude_sensor(&latitude);
+    this->set_longitude_sensor(&longitude);
+    this->set_altitude_sensor(&altitude);
   }
 
   static std::string nmea(const std::string &body) {
@@ -99,8 +103,10 @@ struct Sim : PPSNTPServer {
     snprintf(body, sizeof(body), "GPRMC,%02d%02d%02d.00,%c,4124.8963,N,08151.6838,W,0.0,0.0,%02d%02d%02d,,,A",
              tm.tm_hour, tm.tm_min, tm.tm_sec, fix ? 'A' : 'V', tm.tm_mday, tm.tm_mon + 1, tm.tm_year % 100);
     rx(nmea(body));
-    snprintf(body, sizeof(body), "GPGGA,%02d%02d%02d.00,4124.8963,N,08151.6838,W,1,09,0.9,250.0,M,-33.0,M,,",
-             tm.tm_hour, tm.tm_min, tm.tm_sec);
+    // Quality 0 without a fix; the receiver keeps repeating its last position, which must not count.
+    // The altitude alternates a metre either side of 250 so the interval mean is exercised.
+    snprintf(body, sizeof(body), "GPGGA,%02d%02d%02d.00,4124.8963,N,08151.6838,W,%d,09,0.9,%.1f,M,-33.0,M,,",
+             tm.tm_hour, tm.tm_min, tm.tm_sec, fix ? 1 : 0, k % 2 ? 251.0 : 249.0);
     rx(nmea(body));
     // Two GSV messages: 6 tracked satellites (45+38+41+33+29+22 = 208, mean 34.667) and one in view
     // but untracked, whose empty C/N0 field must not count
@@ -504,6 +510,31 @@ int main(int argc, char **argv) {
     s.note_client_ipv4_(0);
     n = 0; for (auto &c : s.arp_clients_) n += c.load() != 0;
     check(n == 8, "address 0 ignored");
+  }
+
+  begin("R. Position from GGA, averaged over the update interval");
+  {
+    check(std::fabs(nmea_coordinate("4124.8963", "N") - 41.414938) < 1e-6, "ddmm.mmmm latitude");
+    check(std::fabs(nmea_coordinate("08151.6838", "W") + 81.861397) < 1e-6, "dddmm.mmmm longitude, west negative");
+    check(std::fabs(nmea_coordinate("3352.1000", "S") + 33.868333) < 1e-6, "south negative");
+    check(nmea_coordinate("00000.0000", "E") == 0.0, "zero is a real coordinate");
+    check(std::isnan(nmea_coordinate("", "N")), "empty field (no fix) is not a coordinate");
+    check(std::isnan(nmea_coordinate("4160.0000", "N")), "60 minutes is malformed");
+    check(std::isnan(nmea_coordinate("9100.0000", "N")), "latitude beyond 90 degrees rejected");
+    check(std::isnan(nmea_coordinate("4124.8963", "X")), "unknown hemisphere rejected");
+    check(std::isnan(nmea_coordinate("41x4.8963", "N")), "garbage rejected");
+
+    Sim s; s.setup(); s.run(20); s.update();
+    printf("    %.6f, %.6f, %.1f m\n", s.latitude.state, s.longitude.state, s.altitude.state);
+    check(std::fabs(s.latitude.state - 41.414938) < 1e-5, "latitude published");
+    check(std::fabs(s.longitude.state + 81.861397) < 1e-5, "longitude published");
+    check(std::fabs(s.altitude.state - 250.0) < 0.06, "altitude is the interval mean (249/251 alternating)");
+
+    int before = s.latitude.publishes;
+    s.fix = false; s.run(10); s.update();
+    check(s.latitude.publishes == before, "an interval without a fix publishes no position");
+    s.fix = true; s.run(10); s.update();
+    check(s.latitude.publishes == before + 1, "published again once the fix returns");
   }
 
   begin("Z. Counters across every scenario above");

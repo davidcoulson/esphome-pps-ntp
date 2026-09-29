@@ -41,6 +41,11 @@ static constexpr int RX_KEY_LEN = 10;
 /// calls, so the host tests can exercise it directly.
 bool parse_ntp_request_frame(const uint8_t *frame, uint32_t length, uint16_t port, uint8_t *key);
 
+/// Converts an NMEA coordinate (`ddmm.mmmm` or `dddmm.mmmm`) and its hemisphere letter (N/S/E/W) into
+/// signed decimal degrees. Returns NAN for an empty, malformed or out-of-range value. Pure function, so
+/// the host tests can exercise it directly.
+double nmea_coordinate(const char *value, const char *hemisphere);
+
 // Maps the local esp_timer clock (µs since boot) onto UTC, re-fitted on every accepted PPS pulse
 struct ClockModel {
   bool valid{false};
@@ -77,6 +82,9 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void set_signal_strength_sensor(sensor::Sensor *s) { this->signal_strength_sensor_ = s; }
   void set_strong_satellites_sensor(sensor::Sensor *s) { this->strong_satellites_sensor_ = s; }
   void set_hdop_sensor(sensor::Sensor *s) { this->hdop_sensor_ = s; }
+  void set_latitude_sensor(sensor::Sensor *s) { this->latitude_sensor_ = s; }
+  void set_longitude_sensor(sensor::Sensor *s) { this->longitude_sensor_ = s; }
+  void set_altitude_sensor(sensor::Sensor *s) { this->altitude_sensor_ = s; }
   void set_rejected_pulses_sensor(sensor::Sensor *s) { this->rejected_pulses_sensor_ = s; }
   void set_nmea_errors_sensor(sensor::Sensor *s) { this->nmea_errors_sensor_ = s; }
   void set_pulse_age_sensor(sensor::Sensor *s) { this->pulse_age_sensor_ = s; }
@@ -179,6 +187,7 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void handle_nmea_(char *line);
   void handle_rmc_(char **fields, int count);
   void handle_gsv_(char **fields, int count);
+  void handle_gga_(char **fields, int count);
   void finalize_cno_();
   void handle_ubx_(uint8_t msg_class, uint8_t msg_id, const uint8_t *payload, uint16_t len);
   void handle_cfg_gnss_(const uint8_t *payload, uint16_t len);
@@ -310,6 +319,14 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   int strong_satellites_{-1};
   float hdop_{0};  // horizontal dilution of precision, from GGA: the geometry half of fix quality
   bool hdop_valid_{false};
+  // Position from GGA, summed over one update interval and published as the mean: a stationary
+  // receiver's fix wanders by metres from second to second. Doubles, because a float cannot hold a
+  // latitude to better than about half a metre, let alone a sum of sixty of them.
+  double latitude_sum_{0};
+  double longitude_sum_{0};
+  uint32_t position_count_{0};
+  double altitude_sum_{0};
+  uint32_t altitude_count_{0};
 
   // Baud switching for legacy u-blox modules
   enum class BaudState : uint8_t { OFF, PROBE, VERIFY, RETRY_WAIT, DONE };
@@ -323,6 +340,9 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   sensor::Sensor *signal_strength_sensor_{nullptr};
   sensor::Sensor *strong_satellites_sensor_{nullptr};
   sensor::Sensor *hdop_sensor_{nullptr};
+  sensor::Sensor *latitude_sensor_{nullptr};
+  sensor::Sensor *longitude_sensor_{nullptr};
+  sensor::Sensor *altitude_sensor_{nullptr};
   sensor::Sensor *rejected_pulses_sensor_{nullptr};
   sensor::Sensor *nmea_errors_sensor_{nullptr};
   sensor::Sensor *pulse_age_sensor_{nullptr};

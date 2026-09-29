@@ -479,6 +479,17 @@ void PPSNTPServer::update() {
     this->strong_satellites_sensor_->publish_state(this->strong_satellites_);
   if (this->hdop_sensor_ != nullptr && this->hdop_valid_)
     this->hdop_sensor_->publish_state(this->hdop_);
+  // Position: the mean of the interval's fixes; an interval without a fix publishes nothing
+  if (this->position_count_ > 0) {
+    if (this->latitude_sensor_ != nullptr)
+      this->latitude_sensor_->publish_state(this->latitude_sum_ / this->position_count_);
+    if (this->longitude_sensor_ != nullptr)
+      this->longitude_sensor_->publish_state(this->longitude_sum_ / this->position_count_);
+  }
+  if (this->altitude_count_ > 0 && this->altitude_sensor_ != nullptr)
+    this->altitude_sensor_->publish_state(this->altitude_sum_ / this->altitude_count_);
+  this->latitude_sum_ = this->longitude_sum_ = this->altitude_sum_ = 0;
+  this->position_count_ = this->altitude_count_ = 0;
   if (this->rejected_pulses_sensor_ != nullptr)
     this->rejected_pulses_sensor_->publish_state(
         this->edges_seen_ >= this->pulses_accepted_ ? this->edges_seen_ - this->pulses_accepted_ : 0);
@@ -890,14 +901,55 @@ void PPSNTPServer::handle_nmea_(char *line) {
     this->finalize_cno_();
     this->handle_rmc_(fields, count);
   } else if (strcmp(type, "GGA") == 0) {
-    if (count > 7 && fields[7][0] != '\0')
-      this->satellites_ = atoi(fields[7]);
-    if (count > 8 && fields[8][0] != '\0') {
-      this->hdop_ = atof(fields[8]);
-      this->hdop_valid_ = true;
-    }
+    this->handle_gga_(fields, count);
   } else if (strcmp(type, "GSV") == 0) {
     this->handle_gsv_(fields, count);
+  }
+}
+
+double nmea_coordinate(const char *value, const char *hemisphere) {
+  if (value == nullptr || hemisphere == nullptr || value[0] == '\0')
+    return NAN;
+  char *end = nullptr;
+  double raw = strtod(value, &end);
+  if (end == value || *end != '\0' || raw < 0)
+    return NAN;
+  double degrees = std::floor(raw / 100.0);
+  double minutes = raw - degrees * 100.0;
+  if (minutes >= 60.0)
+    return NAN;
+  degrees += minutes / 60.0;
+  bool latitude = hemisphere[0] == 'N' || hemisphere[0] == 'S';
+  bool longitude = hemisphere[0] == 'E' || hemisphere[0] == 'W';
+  if ((!latitude && !longitude) || hemisphere[1] != '\0')
+    return NAN;
+  if (degrees > (latitude ? 90.0 : 180.0))
+    return NAN;
+  return (hemisphere[0] == 'S' || hemisphere[0] == 'W') ? -degrees : degrees;
+}
+
+void PPSNTPServer::handle_gga_(char **fields, int count) {
+  // $--GGA,time,lat,N/S,lon,E/W,quality,sats,hdop,alt,M,geoid,M,...
+  if (count > 7 && fields[7][0] != '\0')
+    this->satellites_ = atoi(fields[7]);
+  if (count > 8 && fields[8][0] != '\0') {
+    this->hdop_ = atof(fields[8]);
+    this->hdop_valid_ = true;
+  }
+  // Quality 0 is "no fix": the receiver may still repeat its last position, which is not a measurement
+  if (count < 7 || fields[6][0] == '\0' || fields[6][0] == '0')
+    return;
+  double latitude = nmea_coordinate(fields[2], fields[3]);
+  double longitude = nmea_coordinate(fields[4], fields[5]);
+  if (std::isnan(latitude) || std::isnan(longitude))
+    return;
+  this->latitude_sum_ += latitude;
+  this->longitude_sum_ += longitude;
+  this->position_count_++;
+  // Altitude above mean sea level, in metres (the unit field is always M)
+  if (count > 10 && fields[9][0] != '\0' && fields[10][0] == 'M') {
+    this->altitude_sum_ += atof(fields[9]);
+    this->altitude_count_++;
   }
 }
 

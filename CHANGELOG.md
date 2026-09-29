@@ -4,6 +4,9 @@ Hardware status: run on an ESP32-S3-ETH against the `gnss_sim` emulator. Not yet
 
 ## Unreleased
 
+## v0.8.0 - 2026-09-29
+- New `latitude`, `longitude` and `altitude` sensors: the receiver's position from the GGA sentences the component already reads, published as the mean of each update interval's fixes. Fixes with GGA quality 0 are ignored, since receivers keep repeating their last position after losing the fix. No extra serial traffic, and nothing changes when the sensors aren't configured.
+
 ## v0.7.0 - 2026-09-23
 - A lost lock no longer silences the server. A PPS gap keeps serving stratum 1 on the held-over model while the fit rebuilds (it was only ever as stale as its holdover); a phase step, rate error or NMEA disagreement answers with stratum 16 (LI=3) until the new fit is ready, so clients see a reply instead of a timeout. Silence is now only for a node that has never synchronised.
 - `rx_delay` / `tx_delay`: measured fixed delays in the node's network path, taken off T2 and added to T3. Default 0.

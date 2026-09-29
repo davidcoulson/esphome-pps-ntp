@@ -12,7 +12,13 @@ from esphome.components.esp32 import (
 import esphome.config_validation as cv
 import esphome.final_validate as fv
 from esphome.const import (
+    CONF_ALTITUDE,
     CONF_ID,
+    CONF_LATITUDE,
+    CONF_LONGITUDE,
+    DEVICE_CLASS_DISTANCE,
+    UNIT_DEGREES,
+    UNIT_METER,
     DEVICE_CLASS_DURATION,
     UNIT_SECOND,
     CONF_PORT,
@@ -203,6 +209,29 @@ CONFIG_SCHEMA = cv.All(
                 state_class=STATE_CLASS_MEASUREMENT,
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
             ),
+            # Position from GGA, averaged over each update interval. Latitude and longitude carry no
+            # state_class: long-term statistics of a fixed position are of no use to anyone.
+            cv.Optional(CONF_LATITUDE): sensor.sensor_schema(
+                unit_of_measurement=UNIT_DEGREES,
+                icon="mdi:latitude",
+                accuracy_decimals=6,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
+            cv.Optional(CONF_LONGITUDE): sensor.sensor_schema(
+                unit_of_measurement=UNIT_DEGREES,
+                icon="mdi:longitude",
+                accuracy_decimals=6,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
+            # Height above mean sea level (GGA field 9), not above the ellipsoid
+            cv.Optional(CONF_ALTITUDE): sensor.sensor_schema(
+                unit_of_measurement=UNIT_METER,
+                device_class=DEVICE_CLASS_DISTANCE,
+                icon="mdi:altimeter",
+                accuracy_decimals=1,
+                state_class=STATE_CLASS_MEASUREMENT,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
             # PPS edges seen but not used: noise on the PPS line, or pulses arriving without a fix
             cv.Optional(CONF_REJECTED_PULSES): sensor.sensor_schema(
                 icon="mdi:pulse",
@@ -354,6 +383,9 @@ async def to_code(config):
         (CONF_SIGNAL_STRENGTH, "set_signal_strength_sensor"),
         (CONF_STRONG_SATELLITES, "set_strong_satellites_sensor"),
         (CONF_HDOP, "set_hdop_sensor"),
+        (CONF_LATITUDE, "set_latitude_sensor"),
+        (CONF_LONGITUDE, "set_longitude_sensor"),
+        (CONF_ALTITUDE, "set_altitude_sensor"),
         (CONF_REJECTED_PULSES, "set_rejected_pulses_sensor"),
         (CONF_NMEA_ERRORS, "set_nmea_errors_sensor"),
         (CONF_PULSE_AGE, "set_pulse_age_sensor"),
