@@ -109,8 +109,10 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_HARDWARE_CAPTURE, default=True): cv.boolean,
             # Pulses in the least-squares fit: longer is quieter, shorter tracks temperature faster
             cv.Optional(CONF_FIT_WINDOW, default=64): cv.int_range(min=8, max=256),
-            # A pulse further than this from the model is an outlier (3 in a row reset the fit)
-            cv.Optional(CONF_MAX_RESIDUAL, default="200us"): cv.All(
+            # A pulse further than this from the model is an outlier (3 in a row reset the fit). Default:
+            # 200 µs with MCPWM hardware capture, 1000 µs with the GPIO interrupt (chosen at boot, since
+            # capture can still fall back at runtime when no MCPWM timer is free)
+            cv.Optional(CONF_MAX_RESIDUAL): cv.All(
                 cv.positive_time_period_microseconds,
                 cv.Range(min=cv.TimePeriod(microseconds=10)),
             ),
@@ -381,7 +383,8 @@ async def to_code(config):
     cg.add(var.set_port(config[CONF_PORT]))
     cg.add(var.set_holdover_s(config[CONF_HOLDOVER].total_seconds))
     cg.add(var.set_fit_window(config[CONF_FIT_WINDOW]))
-    cg.add(var.set_max_residual_us(config[CONF_MAX_RESIDUAL].total_microseconds))
+    if CONF_MAX_RESIDUAL in config:
+        cg.add(var.set_max_residual_us(config[CONF_MAX_RESIDUAL].total_microseconds))
     cg.add(var.set_refid(config[CONF_REFID]))
     cg.add(var.set_require_utc_valid(config[CONF_REQUIRE_UTC_VALID]))
     cg.add(var.set_strong_threshold(config[CONF_STRONG_THRESHOLD]))

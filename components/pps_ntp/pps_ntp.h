@@ -46,6 +46,11 @@ bool parse_ntp_request_frame(const uint8_t *frame, uint32_t length, uint16_t por
 /// the host tests can exercise it directly.
 double nmea_coordinate(const char *value, const char *hemisphere);
 
+/// Places an exact esp_timer counter reading on the scale of esp_timer_get_time(), which truncates to whole
+/// microseconds: the counter in µs, less the mean truncation, (ticks_per_us - 1) / (2 ticks_per_us). Pure
+/// function, so the host tests can exercise it directly.
+double counter_to_stamp_us(double ticks, double ticks_per_us);
+
 // Maps the local esp_timer clock (µs since boot) onto UTC, re-fitted on every accepted PPS pulse
 struct ClockModel {
   bool valid{false};
@@ -134,9 +139,11 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   std::atomic<uint32_t> rx_gain_count_{0};
   void measure_precision_();
   uint32_t last_int_value_{0};
-  // Ties the capture counter to esp_timer: the midpoint of two esp_timer reads around a software latch.
+  // Ties the capture counter to esp_timer: the midpoint of two clock reads around a software latch.
   // Called from the loop and from the Ethernet driver task, serialised by ref_lock_.
   void sample_ref_(uint32_t *ticks, double *us);
+  bool calibrate_raw_counter_();
+  bool raw_counter_{false};             // esp_timer's raw counter checked at setup; else whole-µs reads
   double systimer_ticks_per_us_{16.0};  // esp_timer's counter rate, calibrated at setup
   void note_interrupt_lead_(int64_t hook_us);
   std::atomic<bool> rx_hook_active_{false};
@@ -240,7 +247,7 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   uint8_t outliers_{0};
 
   int fit_window_{64};
-  double max_residual_us_{200.0};
+  double max_residual_us_{0};  // 0: chosen at setup by capture method (200 µs hardware, 1000 µs interrupt)
   char refid_[4]{'G', 'P', 'S', '\0'};  // NTP refid: up to 4 ASCII chars, zero-padded, not NUL-terminated
   std::vector<double> hist_local_;  // sub-µs pulse times from the hardware capture
   std::vector<int64_t> hist_utc_;
@@ -256,7 +263,7 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   uint32_t pulses_accepted_{0};
   double last_counted_pulse_us_{-1};  // the edge pulses_accepted_ last counted
   bool relocking_{false};    // history was reset but the old model still serves (holdover): no outlier test
-  bool ever_synced_{false};  // once true, a lost lock is answered with stratum 16 instead of silence
+  std::atomic<bool> ever_synced_{false};  // once true, a lost lock is answered with stratum 16, not silence
   uint32_t nmea_ok_{0};
   uint32_t nmea_bad_{0};
   uint32_t ubx_frames_{0};
