@@ -112,10 +112,13 @@ void GNSSSim::start_() {
 // esp_timer task: raise the pin as close to the deadline as a task-level callback allows
 void GNSSSim::pulse_cb(void *arg) {
   auto *self = static_cast<GNSSSim *>(arg);
-  if (self->pps_enabled_)
+  if (self->pps_enabled_.load(std::memory_order_relaxed))
     gpio_set_level(static_cast<gpio_num_t>(self->pps_pin_), 1);
-  self->pulse_us_ = esp_timer_get_time();
+  int64_t now = esp_timer_get_time();
+  portENTER_CRITICAL(&self->pulse_lock_);
+  self->pulse_us_ = now;
   self->pulse_count_++;
+  portEXIT_CRITICAL(&self->pulse_lock_);
   self->deadline_us_ += 1000000 + self->ppm_ + self->phase_step_us_.exchange(0);
   int64_t wait = self->deadline_us_ - esp_timer_get_time();
   esp_timer_start_once(self->timer_, wait > 1000 ? wait : 1000);
@@ -131,10 +134,13 @@ void GNSSSim::loop() {
   int64_t now = esp_timer_get_time();
   auto pps = static_cast<gpio_num_t>(this->pps_pin_);
 
+  portENTER_CRITICAL(&this->pulse_lock_);
   uint32_t count = this->pulse_count_;
+  int64_t pulse_us = this->pulse_us_;
+  portEXIT_CRITICAL(&this->pulse_lock_);
   if (count != this->handled_pulse_) {
     this->handled_pulse_ = count;
-    int64_t pulse_us = this->pulse_us_;
+    this->handled_pulse_us_ = pulse_us;
     this->pin_high_ = true;
     this->epoch_pending_ = true;
     this->epoch_due_us_ = pulse_us + this->nmea_delay_us_;
@@ -144,7 +150,7 @@ void GNSSSim::loop() {
     }
   }
 
-  if (this->pin_high_ && now - this->pulse_us_ >= this->pulse_width_us_) {
+  if (this->pin_high_ && now - this->handled_pulse_us_ >= this->pulse_width_us_) {
     gpio_set_level(pps, 0);
     this->pin_high_ = false;
   }
