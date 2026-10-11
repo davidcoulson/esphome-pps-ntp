@@ -455,12 +455,18 @@ bool PPSNTPServer::calibrate_raw_counter_() {
   double ratio = static_cast<double>(raw1 - raw0) / static_cast<double>(us1 - us0);
   double rounded = std::round(ratio);
   bool consistent = rounded >= 1 && std::fabs(ratio - rounded) < 0.01;
+  this->diag_cal_ratio_ = ratio;
+  this->diag_cal_fail_ = consistent ? -1 : 99;
   for (int i = 0; consistent && i < 64; i++) {
     uint64_t before = esp_timer_impl_get_counter_reg();
     int64_t us = esp_timer_get_time();
     uint64_t after = esp_timer_impl_get_counter_reg();
     auto tpu = static_cast<uint64_t>(rounded);
     consistent = static_cast<int64_t>(before / tpu) <= us && us <= static_cast<int64_t>(after / tpu);
+    if (!consistent) {
+      this->diag_cal_fail_ = i;
+      this->diag_b_ = before; this->diag_u_ = us; this->diag_a_ = after;
+    }
   }
   if (!consistent) {
     ESP_LOGW(TAG, "esp_timer raw counter doesn't match esp_timer_get_time() (ratio %.3f); placing PPS edges to "
@@ -573,6 +579,10 @@ void PPSNTPServer::measure_precision_() {
 }
 
 void PPSNTPServer::update() {
+  ESP_LOGW(TAG, "DIAG raw_counter=%d hw_capture=%d tpu=%.3f ratio=%.5f fail=%d b=%lld u=%lld a=%lld jitter=%.3f resid=%.3f",
+           this->raw_counter_, this->hw_capture_, this->systimer_ticks_per_us_, this->diag_cal_ratio_,
+           this->diag_cal_fail_, (long long) this->diag_b_, (long long) this->diag_u_, (long long) this->diag_a_,
+           std::sqrt(this->jitter_sq_us_), this->last_residual_us_);
   ClockModel model = this->get_model_();
   if (this->satellites_sensor_ != nullptr && this->satellites_ >= 0)
     this->satellites_sensor_->publish_state(this->satellites_);

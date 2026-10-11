@@ -167,6 +167,9 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   bool calibrate_raw_counter_();
   bool raw_counter_{false};             // esp_timer's raw counter checked at setup; else whole-µs reads
   double systimer_ticks_per_us_{16.0};  // esp_timer's counter rate, calibrated at setup
+  double diag_cal_ratio_{0};
+  int diag_cal_fail_{-2};  // DIAG: -2 not run, -1 passed, >=0 failing read index, 99 ratio
+  int64_t diag_b_{0}, diag_u_{0}, diag_a_{0};
   void note_interrupt_lead_(int64_t hook_us);
   std::atomic<bool> rx_hook_active_{false};
   std::atomic<bool> driver_rx_timestamp_{true};
