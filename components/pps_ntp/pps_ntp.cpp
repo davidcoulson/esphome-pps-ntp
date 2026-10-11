@@ -10,8 +10,12 @@
 #include <esp_timer.h>
 
 #ifdef USE_PPS_NTP_MCPWM
-// esp_timer's own counter, before its divide down to microseconds: 16 ticks/µs on the S3 and P4
-extern "C" uint64_t esp_timer_impl_get_counter_reg(void);
+// esp_timer's own counter, before its divide down to microseconds: 16 ticks/µs on the S3 and P4. This is
+// private ESP-IDF API (esp_timer/private_include/esp_timer_impl.h, not exported to other components), so
+// it is declared weak: a framework that drops or renames it still links, and setup() checks that the
+// counter really is esp_timer_get_time() times an integer before using it. Either failure falls back to
+// whole-microsecond reads.
+extern "C" uint64_t esp_timer_impl_get_counter_reg(void) __attribute__((weak));
 #endif
 #include <lwip/sockets.h>
 #include <unistd.h>
@@ -159,6 +163,10 @@ static int64_t utc_us_at(const ClockModel &model, int64_t local_us) {
   return internal_to_utc_us(model, internal_us_at(model, local_us));
 }
 
+double counter_to_stamp_us(double ticks, double ticks_per_us) {
+  return ticks / ticks_per_us - (ticks_per_us - 1.0) / (2.0 * ticks_per_us);
+}
+
 static void put_be32(uint8_t *p, uint32_t v) {
   p[0] = v >> 24;
   p[1] = v >> 16;
@@ -187,17 +195,13 @@ void PPSNTPServer::setup() {
   this->pps_pin_->setup();
   this->hw_capture_ = this->setup_capture_();
 #ifdef USE_PPS_NTP_MCPWM
-  if (this->hw_capture_) {
-    // Ratio of esp_timer's raw counter to its microseconds (an exact integer): lets the reference latch
-    // be placed to a fraction of a microsecond instead of the ±0.5 µs of a whole-µs read
-    uint64_t raw0 = esp_timer_impl_get_counter_reg();
-    int64_t us0 = esp_timer_get_time();
-    delay(20);
-    uint64_t raw1 = esp_timer_impl_get_counter_reg();
-    int64_t us1 = esp_timer_get_time();
-    this->systimer_ticks_per_us_ = std::round(static_cast<double>(raw1 - raw0) / static_cast<double>(us1 - us0));
-  }
+  if (this->hw_capture_)
+    this->raw_counter_ = this->calibrate_raw_counter_();
 #endif
+  // Hardware capture jitters well under 1 µs; the GPIO interrupt can lag by hundreds of µs while flash
+  // is busy or Wi-Fi interrupts pile up, so it gets the old, wider default
+  if (this->max_residual_us_ <= 0)
+    this->max_residual_us_ = this->hw_capture_ ? 200.0 : 1000.0;
   if (!this->hw_capture_)
     this->pps_pin_->attach_interrupt(PPSNTPServer::pps_isr, this, gpio::INTERRUPT_RISING_EDGE);
 
@@ -399,19 +403,69 @@ void PPSNTPServer::poll_capture_() {
 #endif
 }
 
+// The raw-counter latch is only used if the private counter read exists and really is esp_timer's
+// microseconds times a whole number, with no offset: the integer ratio is measured over 20 ms, then
+// every one of 64 reads has to land on floor(counter / ratio).
+bool PPSNTPServer::calibrate_raw_counter_() {
+#ifdef USE_PPS_NTP_MCPWM
+  if (esp_timer_impl_get_counter_reg == nullptr) {
+    ESP_LOGW(TAG, "esp_timer raw counter not available; placing PPS edges to whole microseconds");
+    return false;
+  }
+  uint64_t raw0 = esp_timer_impl_get_counter_reg();
+  int64_t us0 = esp_timer_get_time();
+  delay(20);
+  uint64_t raw1 = esp_timer_impl_get_counter_reg();
+  int64_t us1 = esp_timer_get_time();
+  double ratio = static_cast<double>(raw1 - raw0) / static_cast<double>(us1 - us0);
+  double rounded = std::round(ratio);
+  bool consistent = rounded >= 1 && std::fabs(ratio - rounded) < 0.01;
+  for (int i = 0; consistent && i < 64; i++) {
+    uint64_t before = esp_timer_impl_get_counter_reg();
+    int64_t us = esp_timer_get_time();
+    uint64_t after = esp_timer_impl_get_counter_reg();
+    auto tpu = static_cast<uint64_t>(rounded);
+    consistent = static_cast<int64_t>(before / tpu) <= us && us <= static_cast<int64_t>(after / tpu);
+  }
+  if (!consistent) {
+    ESP_LOGW(TAG, "esp_timer raw counter doesn't match esp_timer_get_time() (ratio %.3f); placing PPS edges to "
+                  "whole microseconds", ratio);
+    return false;
+  }
+  this->systimer_ticks_per_us_ = rounded;
+  return true;
+#else
+  return false;
+#endif
+}
+
 void PPSNTPServer::sample_ref_(uint32_t *ticks, double *us) {
 #ifdef USE_PPS_NTP_MCPWM
-  // Latch the capture timer "now" between two reads of esp_timer's raw counter, with nothing able to
-  // preempt us, to place captured edges on the esp_timer timeline. The raw counter (16 MHz) places the
-  // latch to ~60 ns; esp_timer_get_time() would round each read to a whole microsecond. The lock also
-  // keeps the loop and the Ethernet driver task from latching over each other's reading.
-  portENTER_CRITICAL(&this->ref_lock_);
-  uint64_t before = esp_timer_impl_get_counter_reg();
-  mcpwm_capture_channel_trigger_soft_catch(this->cap_ref_);
-  uint64_t after = esp_timer_impl_get_counter_reg();
-  mcpwm_capture_get_latched_value(this->cap_ref_, ticks);
-  portEXIT_CRITICAL(&this->ref_lock_);
-  *us = static_cast<double>(before + after) * 0.5 / this->systimer_ticks_per_us_;
+  // Latch the capture timer "now" between two clock reads, with nothing able to preempt us, to place
+  // captured edges on the esp_timer timeline. The raw counter (16 MHz) places the latch to ~60 ns;
+  // esp_timer_get_time() would round each read to a whole microsecond. The lock also keeps the loop and
+  // the Ethernet driver task from latching over each other's reading.
+  if (this->raw_counter_) {
+    portENTER_CRITICAL(&this->ref_lock_);
+    uint64_t before = esp_timer_impl_get_counter_reg();
+    mcpwm_capture_channel_trigger_soft_catch(this->cap_ref_);
+    uint64_t after = esp_timer_impl_get_counter_reg();
+    mcpwm_capture_get_latched_value(this->cap_ref_, ticks);
+    portEXIT_CRITICAL(&this->ref_lock_);
+    // Every other stamp (NTP receive and transmit, the driver hook) is a whole-µs esp_timer_get_time(),
+    // which truncates: on average it reads (ticks_per_us - 1) / (2 ticks_per_us) µs (0.47 µs at 16 MHz)
+    // before the exact counter time. Put the edges on that same scale, or the model maps every stamp
+    // to a UTC that much early.
+    *us = counter_to_stamp_us(static_cast<double>(before + after) * 0.5, this->systimer_ticks_per_us_);
+  } else {
+    portENTER_CRITICAL(&this->ref_lock_);
+    int64_t before_us = esp_timer_get_time();
+    mcpwm_capture_channel_trigger_soft_catch(this->cap_ref_);
+    int64_t after_us = esp_timer_get_time();
+    mcpwm_capture_get_latched_value(this->cap_ref_, ticks);
+    portEXIT_CRITICAL(&this->ref_lock_);
+    *us = static_cast<double>(before_us + after_us) * 0.5;
+  }
 #endif
 }
 
@@ -751,7 +805,7 @@ void PPSNTPServer::accept_pulse_(double local_us, int64_t utc_s) {
   next.utc_trusted = this->utc_trusted_;
   this->fill_leap_(next);
   if (next.valid && next.utc_trusted)
-    this->ever_synced_ = true;
+    this->ever_synced_.store(true, std::memory_order_relaxed);
   portENTER_CRITICAL(&this->lock_);
   this->model_ = next;
   portEXIT_CRITICAL(&this->lock_);
@@ -1267,7 +1321,7 @@ bool PPSNTPServer::build_reply_(const uint8_t *request, int64_t rx_local_us, uin
   rx_local_us = this->choose_rx_stamp_(request, src_port, rx_local_us);
 
   ClockModel model = this->get_model_();
-  if (!model.valid && !this->ever_synced_)
+  if (!model.valid && !this->ever_synced_.load(std::memory_order_relaxed))
     return false;  // never synchronised: stay silent rather than hand out a bogus time
   // Lost lock after having been synchronised: answer with stratum 16 (clients discard the time but
   // don't time out) using the last model, until the new fit is ready

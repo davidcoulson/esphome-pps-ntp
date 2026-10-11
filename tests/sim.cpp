@@ -537,6 +537,45 @@ int main(int argc, char **argv) {
     check(s.latitude.publishes == before + 1, "published again once the fix returns");
   }
 
+  begin("S. rx/tx delay compensation, max_residual default, clock scale");
+  {
+    auto ts_us = [](const uint8_t *r) {
+      uint32_t sec = (r[0] << 24) | (r[1] << 16) | (r[2] << 8) | r[3];
+      uint32_t frac = (r[4] << 24) | (r[5] << 16) | (r[6] << 8) | r[7];
+      return (static_cast<long double>(sec) - 2208988800.0L) * 1e6L + frac * 1e6L / 4294967296.0L;
+    };
+    Sim s; s.setup(); s.run(30);
+    check(s.served > 0, "synced");
+    uint8_t req[48] = {0x23}, rep[48];
+    s.build_reply_(req, g_now_us, 0, rep);
+    long double t2 = ts_us(rep + 32), t3 = ts_us(rep + 40);
+    s.set_rx_delay_us(30); s.set_tx_delay_us(20);
+    s.build_reply_(req, g_now_us, 0, rep);
+    printf("    T2 moved %.2f us, T3 moved %.2f us\n", static_cast<double>(ts_us(rep + 32) - t2),
+           static_cast<double>(ts_us(rep + 40) - t3));
+    check(std::fabs(static_cast<double>(ts_us(rep + 32) - t2) + 30) < 0.01, "rx_delay taken off T2");
+    check(std::fabs(static_cast<double>(ts_us(rep + 40) - t3) - 20) < 0.01, "tx_delay added to T3");
+    s.rx_hook_active_ = true;
+    uint8_t k[RX_KEY_LEN] = {}; k[8] = 0x12; k[9] = 0x34;
+    s.rx_record_(k, g_now_us - 700);
+    s.build_reply_(req, g_now_us, 0x1234, rep);
+    check(std::fabs(static_cast<double>(ts_us(rep + 32) - t2) + 730) < 0.01, "rx_delay also taken off a driver stamp");
+
+    check(s.max_residual_us_ == 1000.0, "GPIO interrupt capture: max_residual defaults to 1000 us");
+    Sim e; e.set_max_residual_us(50); e.setup();
+    check(e.max_residual_us_ == 50.0, "an explicit max_residual is kept");
+
+    // esp_timer_get_time() truncates the counter: over every sub-microsecond phase it averages the
+    // counter's microseconds less 15/32 (at 16 ticks/µs). Edges placed by counter_to_stamp_us must agree.
+    double floor_sum = 0, placed_sum = 0;
+    for (uint64_t c = 16 * 1000003; c < 16 * 1000003 + 16; c++) {
+      floor_sum += static_cast<double>(c / 16);
+      placed_sum += counter_to_stamp_us(static_cast<double>(c), 16.0);
+    }
+    check(std::fabs(placed_sum - floor_sum) < 1e-6, "edges sit on esp_timer_get_time()'s truncated scale");
+    check(counter_to_stamp_us(1234567.0, 1.0) == 1234567.0, "a 1 tick/us counter needs no correction");
+  }
+
   begin("Z. Counters across every scenario above");
   check(!g_counter_underflow, "never accepted more pulses than edges seen (rejected_pulses can't underflow)");
 

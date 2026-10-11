@@ -3,6 +3,11 @@
 Hardware status: run on an ESP32-S3-ETH against the `gnss_sim` emulator. Not yet run against a real receiver.
 
 ## Unreleased
+- Fix: with MCPWM hardware capture, served time ran about 0.47 µs early. Since v0.7.0 PPS edges were placed on esp_timer's exact counter, but every NTP receive and transmit stamp is a whole-µs `esp_timer_get_time()`, which truncates. The edges are now placed on that same truncated scale.
+- The raw esp_timer counter is private ESP-IDF API. It is now declared weak and checked at boot against `esp_timer_get_time()` (an integer ratio, no offset). If it's missing or doesn't match, the reference latch falls back to whole-microsecond reads with a warning, instead of failing to link or placing edges on a shifted timeline.
+- `max_residual` defaults to 200 µs only with MCPWM hardware capture. The GPIO interrupt, including the IDF < 6 fallback added in v0.8.1, gets 1000 µs again, because its latency can exceed 200 µs for several pulses running while flash is busy, which dropped the server to stratum 16. An explicit `max_residual` is used as given.
+- The "has ever synchronised" flag the reply path reads from the NTP task is now atomic.
+- Host tests for `rx_delay` / `tx_delay`, the `max_residual` default and the counter-to-stamp scale.
 
 ## v0.8.1 - 2026-09-29
 - MCPWM hardware capture now needs ESP-IDF 6.0 or newer, which is where `mcpwm_capture_get_latched_value()` first appears. On an older framework the component falls back to the GPIO interrupt with a compile-time warning instead of failing to build, and `rx_reference_pin` is rejected with a clear message. Builds on IDF 6.x are unchanged. Every release since v0.7.0 failed to compile on IDF 5.5.
