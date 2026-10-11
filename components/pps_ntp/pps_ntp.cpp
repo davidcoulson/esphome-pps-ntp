@@ -56,8 +56,6 @@ static constexpr int64_t GPS_WEEK_ROLLOVER_S = 619315200;    // 1024 weeks
 static constexpr uint32_t BAUD_PROBE_MS = 1500;
 static constexpr double MAX_RATE_ERROR_PPM = 500.0;   // reject fits that imply a broken crystal
 static constexpr int64_t MAX_PULSE_GAP_S = 600;       // longer gaps are relabelled from NMEA
-static constexpr double REF_LATCH_NARROW_US = 2.0;  // a reference latch window wider than this is retried
-static constexpr int REF_LATCH_ATTEMPTS = 8;
 static constexpr int64_t FIX_STALE_US = 3000000;      // pulses only count while the receiver reports a fix
 static constexpr int64_t RMC_MAX_DELAY_US = 950000;   // RMC must follow its pulse within this window
 static constexpr double MAX_ALIGN_TOLERANCE_US = 100000;  // an edge further than this from a whole second isn't PPS
@@ -199,6 +197,16 @@ static int64_t utc_us_at(const ClockModel &model, int64_t local_us) {
 
 double counter_to_stamp_us(double ticks, double ticks_per_us) {
   return ticks / ticks_per_us - (ticks_per_us - 1.0) / (2.0 * ticks_per_us);
+}
+
+void RefLatchPick::add(uint64_t before, uint64_t after, uint32_t latched) {
+  uint64_t w = after - before;
+  this->attempts++;
+  if (w < this->width) {
+    this->width = w;
+    this->mid2 = before + after;
+    this->ticks = latched;
+  }
 }
 
 static void put_be32(uint8_t *p, uint32_t v) {
@@ -447,6 +455,7 @@ bool PPSNTPServer::calibrate_raw_counter_() {
 #ifdef USE_PPS_NTP_MCPWM
   if (esp_timer_impl_get_counter_reg == nullptr) {
     ESP_LOGW(TAG, "esp_timer raw counter not available; placing PPS edges to whole microseconds");
+    this->raw_counter_note_ = "esp_timer_impl_get_counter_reg not linked";
     return false;
   }
   uint64_t raw0 = esp_timer_impl_get_counter_reg();
@@ -455,6 +464,7 @@ bool PPSNTPServer::calibrate_raw_counter_() {
   uint64_t raw1 = esp_timer_impl_get_counter_reg();
   int64_t us1 = esp_timer_get_time();
   double ratio = static_cast<double>(raw1 - raw0) / static_cast<double>(us1 - us0);
+  this->raw_counter_ratio_ = ratio;
   double rounded = std::round(ratio);
   bool consistent = rounded >= 1 && std::fabs(ratio - rounded) < 0.01;
   for (int i = 0; consistent && i < 64; i++) {
@@ -467,9 +477,11 @@ bool PPSNTPServer::calibrate_raw_counter_() {
   if (!consistent) {
     ESP_LOGW(TAG, "esp_timer raw counter doesn't match esp_timer_get_time() (ratio %.3f); placing PPS edges to "
                   "whole microseconds", ratio);
+    this->raw_counter_note_ = "doesn't match esp_timer_get_time()";
     return false;
   }
   this->systimer_ticks_per_us_ = rounded;
+  this->raw_counter_note_ = "in use";
   return true;
 #else
   return false;
@@ -487,10 +499,12 @@ void PPSNTPServer::sample_ref_(uint32_t *ticks, double *us) {
   // flash/PSRAM bus. The midpoint then misplaces the edge by up to half the window, and that pulse drags
   // the fit for a minute (PPS jitter 0.5-1.5 µs instead of 0.03). So latch again until the window is
   // narrow, and use the narrowest one.
+  RefLatchPick pick;
+  double unit_us;  // one unit of the clock reads, in µs
   if (this->raw_counter_) {
-    const uint64_t narrow = static_cast<uint64_t>(REF_LATCH_NARROW_US * this->systimer_ticks_per_us_);
-    uint64_t best_width = UINT64_MAX, best_mid2 = 0;
-    for (int attempt = 0; attempt < REF_LATCH_ATTEMPTS && best_width > narrow; attempt++) {
+    unit_us = 1.0 / this->systimer_ticks_per_us_;
+    const auto narrow = static_cast<uint64_t>(REF_LATCH_NARROW_US * this->systimer_ticks_per_us_);
+    while (!pick.done(narrow)) {
       uint32_t latched;
       portENTER_CRITICAL(&this->ref_lock_);
       uint64_t before = esp_timer_impl_get_counter_reg();
@@ -498,21 +512,16 @@ void PPSNTPServer::sample_ref_(uint32_t *ticks, double *us) {
       uint64_t after = esp_timer_impl_get_counter_reg();
       mcpwm_capture_get_latched_value(this->cap_ref_, &latched);
       portEXIT_CRITICAL(&this->ref_lock_);
-      if (after - before < best_width) {
-        best_width = after - before;
-        best_mid2 = before + after;
-        *ticks = latched;
-      }
+      pick.add(before, after, latched);
     }
     // Every other stamp (NTP receive and transmit, the driver hook) is a whole-µs esp_timer_get_time(),
     // which truncates: on average it reads (ticks_per_us - 1) / (2 ticks_per_us) µs (0.47 µs at 16 MHz)
     // before the exact counter time. Put the edges on that same scale, or the model maps every stamp
     // to a UTC that much early.
-    *us = counter_to_stamp_us(static_cast<double>(best_mid2) * 0.5, this->systimer_ticks_per_us_);
+    *us = counter_to_stamp_us(static_cast<double>(pick.mid2) * 0.5, this->systimer_ticks_per_us_);
   } else {
-    int64_t best_width = INT64_MAX, best_mid2 = 0;
-    for (int attempt = 0; attempt < REF_LATCH_ATTEMPTS && best_width > static_cast<int64_t>(REF_LATCH_NARROW_US);
-         attempt++) {
+    unit_us = 1.0;
+    while (!pick.done(static_cast<uint64_t>(REF_LATCH_NARROW_US))) {
       uint32_t latched;
       portENTER_CRITICAL(&this->ref_lock_);
       int64_t before_us = esp_timer_get_time();
@@ -520,13 +529,20 @@ void PPSNTPServer::sample_ref_(uint32_t *ticks, double *us) {
       int64_t after_us = esp_timer_get_time();
       mcpwm_capture_get_latched_value(this->cap_ref_, &latched);
       portEXIT_CRITICAL(&this->ref_lock_);
-      if (after_us - before_us < best_width) {
-        best_width = after_us - before_us;
-        best_mid2 = before_us + after_us;
-        *ticks = latched;
-      }
+      pick.add(static_cast<uint64_t>(before_us), static_cast<uint64_t>(after_us), latched);
     }
-    *us = static_cast<double>(best_mid2) * 0.5;
+    *us = static_cast<double>(pick.mid2) * 0.5;
+  }
+  *ticks = pick.ticks;
+  // How often the latch stalls, and how badly, for the status line: a rising count means something
+  // else is holding the bus (see the comment above), even while the retries keep it out of the fit
+  if (pick.attempts > 1)
+    this->ref_retried_.fetch_add(1, std::memory_order_relaxed);
+  if (pick.width * unit_us > REF_LATCH_NARROW_US)
+    this->ref_wide_.fetch_add(1, std::memory_order_relaxed);
+  auto width_ns = static_cast<uint32_t>(std::min(pick.width * unit_us * 1000.0, 4e9));
+  uint32_t widest = this->ref_widest_ns_.load(std::memory_order_relaxed);
+  while (width_ns > widest && !this->ref_widest_ns_.compare_exchange_weak(widest, width_ns, std::memory_order_relaxed)) {
   }
 #endif
 }
@@ -671,6 +687,26 @@ void PPSNTPServer::log_status_() {
   } else {
     strcpy(stack_free, "n/a");  // the raw lwIP transport runs in the tcpip thread, with no task of ours
   }
+#ifdef USE_PPS_NTP_MCPWM
+  if (this->hw_capture_) {
+    // At WARN too, like the two above: the setup warning is gone before an API log client can connect,
+    // and dump_config is compiled out under a fleet-wide `logger: level: WARN`
+    if (!this->raw_counter_)
+      ESP_LOGW(TAG, "Reference latch reads whole microseconds (esp_timer raw counter %s); PPS edges are placed to "
+                    "+-0.5 us", this->raw_counter_note_);
+    uint32_t wide = this->ref_wide_.load(std::memory_order_relaxed);
+    if (wide != this->status_ref_wide_)
+      ESP_LOGW(TAG, "%u reference latches stayed wider than %.0f us after %d attempts; those PPS edges may be "
+                    "misplaced by up to half that", static_cast<unsigned>(wide - this->status_ref_wide_),
+               REF_LATCH_NARROW_US, REF_LATCH_ATTEMPTS);
+    this->status_ref_wide_ = wide;
+    // Counts since boot; widest is the widest window used since the last status line
+    ESP_LOGD(TAG, "reference latch: retried=%u still_wide=%u widest=%.2fus clock=%s",
+             static_cast<unsigned>(this->ref_retried_.load(std::memory_order_relaxed)), static_cast<unsigned>(wide),
+             this->ref_widest_ns_.exchange(0, std::memory_order_relaxed) / 1000.0,
+             this->raw_counter_ ? "raw counter" : "whole us");
+  }
+#endif
   ESP_LOGD(TAG,
            "edges=%u accepted=%u nmea=%u/%u bad ubx=%u utc_valid=%s fit=%d/%d confirmed=%u residual=%.1fus "
            "jitter=%.1fus sats=%d cno=%.1f strong=%d hdop=%.1f stack_free=%s rx_hook=%u/%u arp=%u",
@@ -689,6 +725,15 @@ void PPSNTPServer::dump_config() {
 #ifdef USE_PPS_NTP_MCPWM
   if (this->hw_capture_) {
     ESP_LOGCONFIG(TAG, "  PPS capture: MCPWM hardware (group %d, %.0f MHz)", this->cap_group_, this->cap_ticks_per_us_);
+    // Which clock the reference latch reads: the raw counter places edges to ~60 ns, whole µs to ±0.5 µs.
+    // The setup warning when it falls back is gone by the time an API log client connects; this isn't.
+    if (this->raw_counter_) {
+      ESP_LOGCONFIG(TAG, "  Reference latch: esp_timer raw counter, %.0f ticks/us (measured %.3f)",
+                    this->systimer_ticks_per_us_, this->raw_counter_ratio_);
+    } else {
+      ESP_LOGCONFIG(TAG, "  Reference latch: whole microseconds (raw counter %s, measured ratio %.3f)",
+                    this->raw_counter_note_, this->raw_counter_ratio_);
+    }
   } else {
     ESP_LOGCONFIG(TAG, "  PPS capture: GPIO interrupt (MCPWM unavailable)");
   }

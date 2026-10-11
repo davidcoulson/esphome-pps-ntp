@@ -154,7 +154,15 @@ edges=61 accepted=60 nmea=122/0 bad ubx=9 utc_valid=YES fit=60/64 confirmed=57 r
 - `stack_free`: the NTP task's stack high-water mark in bytes, or `n/a` on the raw lwIP transport, which has no task of its own.
 - `rx_hook=hits/misses`: requests that found their driver-level stamp, and ones that fell back to the stack stamp. `arp`: ARP requests sent to keep client entries warm.
 
-At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports when no PPS edges or no valid NMEA arrived during the interval. Those are the two symptoms of a wiring fault, and nothing else would log them.
+With MCPWM capture, a second line reports the reference latch that ties capture ticks to esp_timer:
+
+```
+reference latch: retried=42 still_wide=0 widest=1.06us clock=raw counter
+```
+
+- `retried`: latches since boot whose first window was wider than 2 µs, so they were taken again (up to 8 times). `still_wide`: latches still wider after every attempt; those edges may be off by up to half the window. `widest`: the widest window used since the last status line. `clock`: `raw counter` (esp_timer's 16 MHz counter, ~60 ns) or `whole us`.
+
+At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports when no PPS edges or no valid NMEA arrived during the interval. Those are the two symptoms of a wiring fault, and nothing else would log them. With MCPWM capture it also warns, at every update, when the reference latch reads whole microseconds instead of the raw counter, and when any latch stayed wide after every retry.
 
 ## Tests
 
