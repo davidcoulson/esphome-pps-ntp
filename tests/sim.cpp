@@ -612,7 +612,8 @@ int main(int argc, char **argv) {
           "another client with the same transmit timestamp and port: no match");
     s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1234, rep);
     check(std::fabs(off_stack(stack_t2) - 700) < 2, "the right client still finds its stamp");
-    s.rx_record_(k, g_now_us - 900); s.rx_record_(k, g_now_us - 500);  // a retransmitted request
+    // A retransmitted request, the newer copy recorded first so first-match and oldest-first differ
+    s.rx_record_(k, g_now_us - 500); s.rx_record_(k, g_now_us - 900);
     s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1234, rep);
     double first = off_stack(stack_t2);
     s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1234, rep);
