@@ -112,10 +112,11 @@ void GNSSSim::start_() {
 // esp_timer task: raise the pin as close to the deadline as a task-level callback allows
 void GNSSSim::pulse_cb(void *arg) {
   auto *self = static_cast<GNSSSim *>(arg);
+  int64_t now = esp_timer_get_time();
+  // Raise and publish together, so loop() never sees the pin up without the pulse that raised it
+  portENTER_CRITICAL(&self->pulse_lock_);
   if (self->pps_enabled_.load(std::memory_order_relaxed))
     gpio_set_level(static_cast<gpio_num_t>(self->pps_pin_), 1);
-  int64_t now = esp_timer_get_time();
-  portENTER_CRITICAL(&self->pulse_lock_);
   self->pulse_us_ = now;
   self->pulse_count_++;
   portEXIT_CRITICAL(&self->pulse_lock_);
@@ -151,7 +152,12 @@ void GNSSSim::loop() {
   }
 
   if (this->pin_high_ && now - this->handled_pulse_us_ >= this->pulse_width_us_) {
-    gpio_set_level(pps, 0);
+    // Only end the pulse this loop has handled: if the timer raised the next one since the snapshot,
+    // leave the pin up and pick that pulse up on the next pass
+    portENTER_CRITICAL(&this->pulse_lock_);
+    if (this->pulse_count_ == this->handled_pulse_)
+      gpio_set_level(pps, 0);
+    portEXIT_CRITICAL(&this->pulse_lock_);
     this->pin_high_ = false;
   }
   if (this->glitch_due_us_ != 0 && now >= this->glitch_due_us_) {
