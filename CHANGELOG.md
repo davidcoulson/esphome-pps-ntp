@@ -1,9 +1,11 @@
 # Changelog
 
-Hardware status: run on an ESP32-S3-ETH against the `gnss_sim` emulator. Not yet run against a real receiver.
+Hardware status: in service since September 2026 on an ESP32-P4 (RMII Ethernet, MCPWM capture) with a u-blox NEO-7M and on an ESP32-S3-ETH (W5500) with a NEO-M9N, both on ESP-IDF 6.1. Earlier releases were tested against the `gnss_sim` emulator.
 
 ## Unreleased
-- Fix: with MCPWM hardware capture, PPS jitter on the ESP32-P4 rose from about 0.03 µs to 0.5-1.5 µs. The software reference latch that ties the capture timer to esp_timer is bracketed by two counter reads; now and then something stalls them (windows of 8-15 µs instead of ~1 µs), and the midpoint then misplaced the edge by several µs, which dragged the fit for a minute. The latch is now retried until its window is under 2 µs (up to 8 tries, keeping the narrowest). Seen on hardware and confirmed fixed there (jitter back to 0.03-0.07 µs).
+
+## v0.9.0 - 2026-10-11
+- The software reference latch that ties the MCPWM capture timer to esp_timer is now retried until its window is under 2 µs (up to 8 tries, keeping the narrowest). On the ESP32-P4 the two counter reads around it are occasionally stalled to 8-15 µs (most likely a cache miss while the other core holds the flash/PSRAM bus), and the edge, placed at the window's midpoint, was then off by several µs and dragged the fit for a minute. PPS jitter on the P4 stays at 0.03-0.07 µs.
 - Fix: with MCPWM hardware capture, served time ran about 0.47 µs early. Since v0.7.0 PPS edges were placed on esp_timer's exact counter, but every NTP receive and transmit stamp is a whole-µs `esp_timer_get_time()`, which truncates. The edges are now placed on that same truncated scale.
 - The raw esp_timer counter is private ESP-IDF API. It is now declared weak and checked at boot against `esp_timer_get_time()` (an integer ratio, no offset). If it's missing or doesn't match, the reference latch falls back to whole-microsecond reads with a warning, instead of failing to link or placing edges on a shifted timeline.
 - `max_residual` defaults to 200 µs only with MCPWM hardware capture. The GPIO interrupt, including the IDF < 6 fallback added in v0.8.1, gets 1000 µs again, because its latency can exceed 200 µs for several pulses running while flash is busy, which dropped the server to stratum 16. An explicit `max_residual` is used as given.
