@@ -58,6 +58,23 @@ double nmea_coordinate(const char *value, const char *hemisphere);
 /// function, so the host tests can exercise it directly.
 double counter_to_stamp_us(double ticks, double ticks_per_us);
 
+static constexpr double REF_LATCH_NARROW_US = 2.0;  // a reference latch window wider than this is retried
+static constexpr int REF_LATCH_ATTEMPTS = 8;
+
+/// Keeps the narrowest of up to REF_LATCH_ATTEMPTS reference latches. Each attempt is a pair of clock reads
+/// (`before`, `after`: counter ticks or whole µs) around a software latch of the capture timer. A read that
+/// stalls widens the window, and its midpoint then misplaces the latch by up to half of it. Pure, so the
+/// host tests can exercise it directly.
+struct RefLatchPick {
+  uint64_t width{UINT64_MAX};  // narrowest window so far
+  uint64_t mid2{0};            // before + after of that window
+  uint32_t ticks{0};           // capture-timer value latched in it
+  int attempts{0};
+  void add(uint64_t before, uint64_t after, uint32_t latched);
+  // `narrow` is in the reads' own unit
+  bool done(uint64_t narrow) const { return attempts >= REF_LATCH_ATTEMPTS || (attempts > 0 && width <= narrow); }
+};
+
 // Maps the local esp_timer clock (µs since boot) onto UTC, re-fitted on every accepted PPS pulse
 struct ClockModel {
   bool valid{false};
@@ -167,6 +184,13 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   bool calibrate_raw_counter_();
   bool raw_counter_{false};             // esp_timer's raw counter checked at setup; else whole-µs reads
   double systimer_ticks_per_us_{16.0};  // esp_timer's counter rate, calibrated at setup
+  const char *raw_counter_note_{"not checked"};  // why the raw counter isn't used, for dump_config
+  double raw_counter_ratio_{0};                  // the counter/µs ratio measured at setup (0: not measured)
+  // Reference latches whose first window was wide (retried), and those still wide after every attempt.
+  // Counted from the loop and the driver task.
+  std::atomic<uint32_t> ref_retried_{0};
+  std::atomic<uint32_t> ref_wide_{0};
+  std::atomic<uint32_t> ref_widest_ns_{0};  // widest window kept since the last status line
   void note_interrupt_lead_(int64_t hook_us);
   std::atomic<bool> rx_hook_active_{false};
   std::atomic<bool> driver_rx_timestamp_{true};
@@ -294,6 +318,7 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   uint32_t ubx_frames_{0};
   uint32_t status_edges_{0};  // edges_seen_ / nmea_ok_ at the previous update(), to spot a dead input
   uint32_t status_nmea_{0};
+  uint32_t status_ref_wide_{0};  // ref_wide_ at the previous update()
   bool rollover_warned_{false};
 
   // Model shared with the NTP task

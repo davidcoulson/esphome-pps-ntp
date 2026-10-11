@@ -39,6 +39,7 @@ struct Sim : PPSNTPServer {
   bool nmea_on = true;          // sentences keep coming without PPS (a receiver with no fix still talks)
   bool capture = false;         // MCPWM-like capture: sub-µs edge times handed straight to the discipline
   double capture_frac_us = 0.375;
+  std::function<double(int64_t)> capture_err_us = [](int64_t) { return 0.0; };  // edge misplacement on pulse k
   bool answers_ubx = true;      // answers UBX at all
   bool answers_timeutc = true;  // answers NAV-TIMEUTC specifically (some receivers know only some messages)
   bool utc_valid = true;
@@ -206,7 +207,7 @@ struct Sim : PPSNTPServer {
         if (pps_on) {
           g_now_us = pulse_at + static_cast<int64_t>(std::llround(noise(rng))) + pulse_err_us(k);
           if (capture) {
-            this->handle_pulse_(static_cast<double>(g_now_us) + capture_frac_us);
+            this->handle_pulse_(static_cast<double>(g_now_us) + capture_frac_us + capture_err_us(k));
           } else {
             PPSNTPServer::pps_isr(this);
           }
@@ -433,6 +434,51 @@ int main(int argc, char **argv) {
     s.date_offset_s = 1; s.run(15, false);
     printf("    edges %u, counted as accepted %u\n", s.edges_seen_ - e0, s.pulses_accepted_ - a0);
     check(s.pulses_accepted_ - a0 <= s.edges_seen_ - e0, "the relabelled pulse is not counted a second time");
+  }
+
+  begin("K3. Hardware capture: a stalled reference latch (seen on the ESP32-P4) is retried, so it can't drag the fit");
+  {
+    // The reference latch on a 16 MHz counter: two reads around the capture timer's software latch, normally
+    // 17 ticks apart (~1 us). Every 20th pulse the first attempt stalls 200 ticks (12.5 us) after the latch,
+    // like the 130-247 tick windows logged on the P4. `max_attempts` 1 is the single latch before v0.9.0.
+    const auto narrow = static_cast<uint64_t>(REF_LATCH_NARROW_US * 16);
+    auto latch_err_us = [&](int64_t k, int max_attempts, int *attempts) {
+      RefLatchPick pick;
+      uint64_t at = 16000000 + static_cast<uint64_t>(k) * 997;  // counter value at this attempt's latch
+      while (!pick.done(narrow) && pick.attempts < max_attempts) {
+        bool stall = k % 20 == 0 && pick.attempts == 0;
+        pick.add(at - 8, at + 9 + (stall ? 200 : 0), static_cast<uint32_t>(at));
+        at += 40;
+      }
+      if (attempts != nullptr) *attempts = pick.attempts;
+      // The edge is placed from the midpoint; its error is the midpoint's distance from the latch it belongs to
+      return (static_cast<double>(pick.mid2) * 0.5 - static_cast<double>(pick.ticks)) / 16.0;
+    };
+    int n = 0;
+    double err0 = latch_err_us(1, REF_LATCH_ATTEMPTS, &n);
+    check(n == 1 && std::fabs(err0) < 0.05, "a narrow first latch is used as is");
+    double err20 = latch_err_us(20, REF_LATCH_ATTEMPTS, &n);
+    check(n == 2 && std::fabs(err20) < 0.05, "a stalled latch is retried and the narrow one kept");
+    RefLatchPick wide;
+    for (int i = 0; !wide.done(narrow); i++)
+      wide.add(1000, 1000 + 100 + (i == 3 ? 0 : 50), 7 + i);
+    check(wide.attempts == REF_LATCH_ATTEMPTS && wide.width == 100 && wide.ticks == 10,
+          "all wide: every attempt made, the narrowest kept with its own capture value");
+
+    double jitter[2], served[2];
+    for (int retry = 0; retry < 2; retry++) {
+      Sim s; s.capture = true; s.jitter_us = 0; s.set_max_residual_us(200);
+      s.capture_err_us = [&, retry](int64_t k) { return latch_err_us(k, retry ? REF_LATCH_ATTEMPTS : 1, nullptr); };
+      s.setup(); s.hw_capture_ = true;
+      s.run(120, false);
+      s.worst_served_error_us = 0; s.run(180);
+      jitter[retry] = std::sqrt(s.jitter_sq_us_);
+      served[retry] = s.worst_served_error_us;
+    }
+    printf("    PPS jitter: single latch %.2f us, retried %.3f us; worst served error %.2f / %.2f us\n", jitter[0],
+           jitter[1], served[0], served[1]);
+    check(jitter[0] > 0.3, "a single stalled latch every 20 s drives the jitter up (the regression)");
+    check(jitter[1] < 0.05, "retried latches keep the jitter at the hardware-capture floor");
   }
 
   // 2026-12-31 23:59:59 UTC = 1798761599
