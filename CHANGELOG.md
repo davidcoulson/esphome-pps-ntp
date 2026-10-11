@@ -3,8 +3,10 @@
 Hardware status: in service since September 2026 on an ESP32-P4 (RMII Ethernet, MCPWM capture) with a u-blox NEO-7M and on an ESP32-S3-ETH (W5500) with a NEO-M9N, both on ESP-IDF 6.1. Earlier releases were tested against the `gnss_sim` emulator.
 
 ## Unreleased
+
+## v0.9.1 - 2026-10-11
 - Reference latch diagnostics. `dump_config` says which clock the latch reads (esp_timer's raw counter with its ticks/µs, or whole microseconds and why), and the status line adds `reference latch: retried=… still_wide=… widest=…us`. Two WARN lines survive `logger: level: WARN`: the latch has fallen back to whole microseconds, or some latches stayed wide after every retry. Before, the fallback was a single setup warning, gone before an API log client could connect.
-- Tests: scenario K3 reproduces the v0.9.0 P4 regression in the host sim. One stalled latch every 20 pulses drives PPS jitter to ~1.1 µs with a single latch and leaves it at the floor with the retry. Checks for the narrowest-latch picker (now `RefLatchPick`, shared by both latch paths).
+- Tests: scenario K3 reproduces the stalled-latch jitter seen on the ESP32-P4 before v0.9.0 in the host sim. One stalled latch every 20 pulses drives PPS jitter to ~1.1 µs with a single latch and leaves it at the floor with the retry. Checks for the narrowest-latch picker (now `RefLatchPick`, shared by both latch paths).
 
 ## v0.9.0 - 2026-10-11
 - The software reference latch that ties the MCPWM capture timer to esp_timer is now retried until its window is under 2 µs (up to 8 tries, keeping the narrowest). On the ESP32-P4 the two counter reads around it are occasionally stalled to 8-15 µs (most likely a cache miss while the other core holds the flash/PSRAM bus), and the edge, placed at the window's midpoint, was then off by several µs and dragged the fit for a minute. PPS jitter on the P4 stays at 0.03-0.07 µs.
