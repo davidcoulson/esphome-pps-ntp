@@ -33,12 +33,19 @@ struct pbuf;
 namespace esphome::pps_ntp {
 
 /// Length of the key that ties a driver-level receive stamp to the request it belongs to: the client's
-/// transmit timestamp (8 bytes, echoed in the request) followed by its UDP source port (big-endian).
-static constexpr int RX_KEY_LEN = 10;
+/// transmit timestamp (8 bytes, echoed in the request), its UDP source port (big-endian) and its source
+/// address (16 bytes; IPv4 as an IPv4-mapped IPv6 address, ::ffff:a.b.c.d).
+static constexpr int RX_KEY_LEN = 26;
+
+/// Builds that key. `addr16` is the source address in the 16-byte form above.
+void make_rx_key(const uint8_t *transmit_ts, const uint8_t *addr16, uint16_t port, uint8_t *key);
+
+/// Writes an IPv4 address (4 bytes, network order) as the IPv4-mapped IPv6 address ::ffff:a.b.c.d.
+void map_ipv4(const uint8_t *v4, uint8_t *addr16);
 
 /// Parses a raw Ethernet frame. Returns true when it is an NTP client request (mode 3) to `port`, over
-/// IPv4 (unfragmented) or IPv6 (no extension headers), and fills `key`. Pure function: no platform
-/// calls, so the host tests can exercise it directly.
+/// IPv4 (unfragmented) or IPv6 (no extension headers), whose declared IP and UDP lengths hold the whole
+/// request, and fills `key`. Pure function: no platform calls, so the host tests can exercise it directly.
 bool parse_ntp_request_frame(const uint8_t *frame, uint32_t length, uint16_t port, uint8_t *key);
 
 /// Converts an NMEA coordinate (`ddmm.mmmm` or `dddmm.mmmm`) and its hemisphere letter (N/S/E/W) into
@@ -117,26 +124,41 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   static void ntp_task(void *arg);
   void ntp_loop_();
   bool start_server_();
-  // Fills a 48-byte reply for a 48-byte (or longer) request; false means stay silent
-  bool build_reply_(const uint8_t *request, int64_t rx_local_us, uint16_t src_port, uint8_t *reply);
+  // Fills a 48-byte reply for a 48-byte (or longer) request from `src_addr` (16 bytes, IPv4-mapped for
+  // IPv4) and `src_port`; false means stay silent
+  bool build_reply_(const uint8_t *request, int64_t rx_local_us, const uint8_t *src_addr, uint16_t src_port,
+                    uint8_t *reply);
 
   // ---- Driver-level receive timestamps ----
   // The stack-level stamp is taken after the frame has crossed the driver and lwIP; that delay lands in the
   // client's offset at half its size and no client can detect it. A hook on the Ethernet driver's input
   // path stamps each NTP request before lwIP sees it, keyed so the reply path can find it again.
+  // Each slot is a seqlock with one writer (the driver task). The payload is held in relaxed atomic words,
+  // so a reader overlapping a write gets a torn copy it then discards, never a data race.
+  static constexpr int RX_KEY_WORDS = (RX_KEY_LEN + 3) / 4;
+  static constexpr int RX_SLOT_WORDS = RX_KEY_WORDS + 2;  // the key, zero-padded, then the stamp (low, high)
   struct RxStamp {
-    std::atomic<uint32_t> seq{0};  // seqlock: odd = write in progress; 0 = never written
-    uint8_t key[RX_KEY_LEN]{};
-    int64_t t{0};
+    std::atomic<uint32_t> seq{0};   // odd = write in progress; 0 = never written
+    std::atomic<uint32_t> used{0};  // the seq whose stamp a reply has already taken: each stamp serves once
+    std::atomic<uint32_t> words[RX_SLOT_WORDS]{};
   };
   static constexpr int RX_RING = 8;
   RxStamp rx_ring_[RX_RING];
   uint8_t rx_ring_next_{0};  // only the driver task writes
   void rx_record_(const uint8_t *key, int64_t t);
   bool rx_lookup_(const uint8_t *key, int64_t now_us, int64_t *t_out);
-  int64_t choose_rx_stamp_(const uint8_t *request, uint16_t src_port, int64_t stack_us);
-  std::atomic<int32_t> rx_gain_sum_us_{0};
-  std::atomic<uint32_t> rx_gain_count_{0};
+  int64_t choose_rx_stamp_(const uint8_t *request, const uint8_t *src_addr, uint16_t src_port, int64_t stack_us);
+  // A sum and count over one update interval: added to by the serving context or the driver task, taken
+  // by update(). The pair moves together under stats_lock_, so no sample is split across two intervals.
+  struct IntervalMean {
+    int32_t sum_us{0};
+    uint32_t count{0};
+  };
+  IntervalMean rx_gain_;   // stack stamp - driver stamp
+  IntervalMean int_lead_;  // driver stamp - Ethernet interrupt edge
+  portMUX_TYPE stats_lock_ = portMUX_INITIALIZER_UNLOCKED;
+  void add_sample_(IntervalMean &mean, int32_t us);
+  IntervalMean take_samples_(IntervalMean &mean);  // returns the interval's pair and starts a new one
   void measure_precision_();
   uint32_t last_int_value_{0};
   // Ties the capture counter to esp_timer: the midpoint of two clock reads around a software latch.
@@ -209,6 +231,7 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void reset_discipline_(const char *reason, bool keep_time);
   void log_status_();
   void publish_model_();
+  bool labels_trusted_() const;
   ClockModel get_model_();
   bool is_synced_(const ClockModel &model, int64_t now_local_us) const;
 
@@ -237,12 +260,14 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
 #endif
 
   // Pulses and labels
-  int64_t last_pulse_us_{0};     // most recent plausible pulse: accepted, or a candidate waiting for its RMC
+  double last_pulse_us_{0};      // most recent plausible pulse: accepted, or a candidate waiting for its RMC.
+                                 // The exact edge time, so an accept after a relabel is the same pulse
   int64_t last_pulse_utc_s_{0};  // the label given to that pulse
   bool last_pulse_labelled_{false};
   uint8_t off_second_edges_{0};     // consecutive edges that weren't a whole number of seconds after the last pulse
   uint8_t label_confirmations_{0};  // RMC sentences that agreed with the pulse count since the last reset
-  int64_t last_rmc_valid_us_{0};  // local time of the last RMC with an 'A' fix
+  uint8_t trusted_confirmations_{0};  // ...of which the receiver had confirmed its UTC (NAV-TIMEUTC validUTC)
+  int64_t last_rmc_valid_us_{0};  // local time of the last RMC with an 'A' fix; 0 after an RMC without one
   uint8_t label_mismatches_{0};
   uint8_t outliers_{0};
 
@@ -283,6 +308,7 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   int64_t leap_midnight_unix_{0};  // the UTC midnight the leap belongs to (the 00:00:00 that follows it)
   bool leap_from_ubx_{false};
   uint32_t last_timels_poll_ms_{0};
+  bool timels_polled_{false};
   int64_t leap_at_internal_() const {
     return this->leap_midnight_unix_ + this->leap_adj_s_ - (this->leap_change_ < 0 ? 1 : 0);
   }
@@ -356,8 +382,6 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   sensor::Sensor *rx_timestamp_gain_sensor_{nullptr};
   sensor::Sensor *rx_interrupt_lead_sensor_{nullptr};
   sensor::Sensor *arp_clients_sensor_{nullptr};
-  std::atomic<int32_t> int_lead_sum_us_{0};
-  std::atomic<uint32_t> int_lead_count_{0};
   sensor::Sensor *frequency_offset_sensor_{nullptr};
   sensor::Sensor *pps_jitter_sensor_{nullptr};
   sensor::Sensor *requests_sensor_{nullptr};

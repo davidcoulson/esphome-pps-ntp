@@ -55,6 +55,12 @@ jobs:
             echo "expected a validation error"; exit 1
           fi
           grep -q "ESP-IDF 6.0.0 or newer" out.txt
+      - name: Disabling the lwIP core lock is rejected
+        run: |
+          if esphome config tests/ci/invalid-core-locking-c3.yaml > out.txt 2>&1; then
+            echo "expected a validation error"; exit 1
+          fi
+          grep -q "needs the tcpip core lock" out.txt
 
   compile:
     name: Compile ${{ matrix.config }}

@@ -21,19 +21,19 @@ GNSS UART ─► NMEA RMC (which second) ┤
 ```
 
 1. **PPS capture.** On chips with an MCPWM unit (ESP32, S3, C5, C6, H2, P4), the capture hardware latches an 80 MHz timer at the moment the PPS edge arrives. No interrupt is involved, so interrupt latency and flash-write stalls (NVS, OTA) can't delay the timestamp. The ESPHome loop reads the latch, then software-latches the same timer between two `esp_timer` reads to map the edge onto the system timeline. Chips without MCPWM, or `hardware_capture: false`, fall back to an IRAM GPIO interrupt.
-2. **Labelling.** The RMC sentence that follows each pulse says which UTC second it marked. After that, pulses are counted, and RMC is used to cross-check.
+2. **Labelling.** The RMC sentence that follows each pulse says which UTC second it marked. After that, pulses are counted, and RMC is used to cross-check. Pulses only count while the receiver reports a fix: an RMC with status `V` stops them at once, since the receiver's PPS then free-runs.
    - The server doesn't answer until 3 later RMCs have independently agreed with the count. That guards against a first label that is off by a whole second.
-   - Stray edges (noise on the PPS line) are ignored. Three misaligned edges in a row, or three RMC disagreements, reset the fit.
+   - Stray edges (noise on the PPS line) are ignored. An edge counts as on the second if it is within `max_residual` of one (plus 100 ppm of the time since the last pulse); three misaligned edges in a row, or three RMC disagreements, reset the fit.
    - Dates before 2026 are treated as a GPS week-number rollover (old and clone receivers) and moved forward by whole multiples of 1024 weeks.
 3. **Discipline.** A least-squares fit over the last 64 pulses gives the crystal's rate and phase. The ESP32 system clock is left alone; NTP timestamps are computed straight from the fit.
 4. **Receiver setup.** Once the link has settled, the receiver is put into its stationary dynamic model, optionally has its unused NMEA sentences silenced, and is asked which constellations it supports — reported in the config dump (so it is visible to any log client, not just one watching at boot), e.g. `GPS(on, max 16 ch), SBAS(on, max 3 ch), QZSS(on, max 3 ch), GLONASS(off, max 14 ch); 22 hardware tracking channels`. These are RAM-only settings, re-applied every boot, so nothing is written to the receiver's flash. A rejected command is logged as a warning.
-5. **Leap-second safety.** The receiver is polled with `UBX-NAV-TIMEUTC`, and the server reports itself as unsynchronised until the receiver confirms UTC is valid. (After a cold start, u-blox receivers can report time with the wrong leap-second count for up to about 12.5 minutes.) Receivers that never answer `NAV-TIMEUTC` fall back to NMEA-only after 60 s, unless `require_utc_valid` is set.
+5. **Leap-second safety.** The receiver is polled with `UBX-NAV-TIMEUTC`, and the server reports itself as unsynchronised until the receiver confirms UTC is valid and 3 RMCs sent after that have agreed with the pulse count. (After a cold start, u-blox receivers can report time with the wrong leap-second count for up to about 12.5 minutes, so labels taken before then are re-checked, and redone if they disagree.) Receivers that never answer `NAV-TIMEUTC` fall back to NMEA-only after 60 s, unless `require_utc_valid` is set.
 6. **Leap seconds.** The fit runs on a continuous count of seconds, so its history stays linear across a leap, and UTC is derived from it with an adjustment that changes by one at the leap.
    - **u-blox 8 and later:** the schedule comes from `UBX-NAV-TIMELS`. Clients get LI=1 (or 2) during the final day, and the step happens exactly at midnight. An inserted second is served as a repeat of 23:59:59, as NTP servers conventionally do.
    - **u-blox 6/7 (no NAV-TIMELS):** the leap is taken from the receiver's own `23:59:60` sentence. There is no advance LI, and for roughly 0.1 s (until that sentence arrives) replies are one second fast.
    - Either way the fit is not reset and the server doesn't go silent.
 7. **Serving.** A dedicated FreeRTOS task, pinned to the core the ESPHome loop isn't using (or, with `transport: raw_lwip`, lwIP's own thread), answers NTPv3 and NTPv4 client requests. Each reply is stamped just before sending.
-   - **Receive stamp (T2).** On Ethernet the component hooks the driver's input path and stamps each NTP request *before* lwIP sees it; the reply finds its stamp again by the client's transmit timestamp and source port. That takes the stack's receive delay out of the time clients compute — a delay no client can detect, since it only shows up as asymmetry. Without Ethernet, or if a request's stamp is missing, the stack-level stamp is used.
+   - **Receive stamp (T2).** On Ethernet the component hooks the driver's input path and stamps each NTP request *before* lwIP sees it; the reply finds its stamp again by the client's transmit timestamp, source address and port, and each stamp answers one request. That takes the stack's receive delay out of the time clients compute — a delay no client can detect, since it only shows up as asymmetry. Without Ethernet, or if a request's stamp is missing, the stack-level stamp is used.
    - **ARP priming.** lwIP doesn't learn a client's MAC from its requests and forgets entries after 5 minutes, so a client polling every 17 minutes would otherwise find the cache cold every time and its reply — already stamped — would wait out an ARP round trip. The component re-ARPs its most recent IPv4 clients (or the gateway, for off-subnet ones) every 2 minutes.
    - **Synced:** stratum 1, refid `GPS` (configurable). The precision field is measured at boot from the system clock (normally 2^-20 s: the 1 µs `esp_timer` step, rounded down to a power of two as ntpd does). Root dispersion is `root_dispersion` (250 µs) plus 5 ppm of holdover drift.
    - **PPS lost:** keeps serving on the local crystal for `holdover` (stratum 1, with dispersion growing over time).
@@ -64,7 +64,7 @@ Wiring (example config):
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.7.0
+  - source: github://davidcoulson/esphome-pps-ntp@v0.8.1
     components: [pps_ntp]
 
 uart:
@@ -105,7 +105,7 @@ For a full config, see [`examples/waveshare-esp32-s3-eth.yaml`](examples/wavesha
 | `strong_signal_threshold` | `35` | The C/N0 in dB-Hz at which a satellite counts towards `strong_satellites`. |
 | `holdover` | `15min` | How long to keep serving stratum 1 after PPS or the fix is lost. |
 | `fit_window` | `64` | Pulses in the least-squares fit (8–256). Longer windows average out more noise; shorter ones track temperature changes in the crystal faster. |
-| `max_residual` | `200us` / `1000us` | A pulse further than this from the model is an outlier; three in a row reset the fit. The default is picked at boot: 200 µs with MCPWM hardware capture, 1000 µs with the GPIO interrupt, whose latency can reach hundreds of µs while flash is busy. Measured hardware-capture jitter is under 1 µs, so `50us` is reasonable once the node has proven stable. |
+| `max_residual` | `200us` / `1000us` | A pulse further than this from the model is an outlier, and an edge further than this from a whole second isn't counted as a pulse; three in a row reset the fit. The default is picked at boot: 200 µs with MCPWM hardware capture, 1000 µs with the GPIO interrupt, whose latency can reach hundreds of µs while flash is busy. Measured hardware-capture jitter is under 1 µs, so `50us` is reasonable once the node has proven stable. |
 | `refid` | `GPS` | NTP reference ID sent to clients (1–4 ASCII characters, e.g. `PPS`). |
 | `stationary` | `true` | Sends `UBX-CFG-NAV5` at boot to put the receiver in its stationary dynamic model. A receiver that knows it cannot be moving constrains its solution, which steadies the time when signals are marginal — worth having on any fixed installation. |
 | `trim_nmea` | `false` | Sends `UBX-CFG-MSG` at boot to silence the NMEA sentences this component doesn't read, keeping RMC, GGA and GSV. Off by default because it changes what the receiver emits. |
@@ -169,7 +169,7 @@ At WARN level (so it survives a fleet-wide `logger: level: WARN`), it reports wh
 
 ```yaml
 external_components:
-  - source: github://davidcoulson/esphome-pps-ntp@v0.7.0
+  - source: github://davidcoulson/esphome-pps-ntp@v0.8.1
     components: [pps_ntp, gnss_sim]
 
 gnss_sim:
@@ -208,6 +208,7 @@ chronyc sources -v              # after adding "server <device-ip> iburst" to ch
 
   The router hop is about 0.35 ms of that, which leaves roughly 0.6–0.7 ms each way inside the W5500, its SPI driver and lwIP. NTP only suffers from the part of that which differs between the two directions, which these numbers can't show; assume a few hundred microseconds of possible error on SPI Ethernet. PPS capture itself is good to about a microsecond, so the network path is the whole error budget. An RMII MAC (ESP32-P4, or a classic ESP32 with a LAN8720) should be much better. `tools/ntpprobe.py` reproduces the measurement.
 - Assumes the receiver's PPS rising edge marks the start of the UTC second (the u-blox default).
+- Needs lwIP's tcpip core lock (`esp32: framework: advanced: enable_lwip_tcpip_core_locking`, on by default in ESPHome): the ARP refresh and `raw_lwip` call lwIP from the main loop. Turning it off is rejected at validation.
 
 ## Credits
 

@@ -355,10 +355,28 @@ def _final_validate_rx_reference(config):
     return config
 
 
+def _final_validate_lwip_core_locking(config):
+    # The ARP refresh (every transport) and transport: raw_lwip call lwIP's core API from the ESPHome
+    # loop, guarded by LwIPLock. That lock is the tcpip core lock: without it, it locks nothing.
+    framework = fv.full_config.get().get("esp32", {}).get("framework", {})
+    advanced = framework.get("advanced", {})
+    sdkconfig = framework.get("sdkconfig_options", {})
+    disabled = advanced.get("enable_lwip_tcpip_core_locking", True) is False or str(
+        sdkconfig.get("CONFIG_LWIP_TCPIP_CORE_LOCKING", "y")
+    ).lower() in ("n", "false", "0")
+    if disabled:
+        raise cv.Invalid(
+            "pps_ntp calls lwIP from the main loop and needs the tcpip core lock; remove "
+            "enable_lwip_tcpip_core_locking: false (or CONFIG_LWIP_TCPIP_CORE_LOCKING: n)"
+        )
+    return config
+
+
 FINAL_VALIDATE_SCHEMA = cv.All(
     uart.final_validate_device_schema("pps_ntp", require_rx=True, require_tx=True),
     _final_validate_task_core,
     _final_validate_rx_reference,
+    _final_validate_lwip_core_locking,
 )
 
 

@@ -5,6 +5,7 @@
 #include <string>
 
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
 
 #include "esphome/core/component.h"
 
@@ -61,7 +62,8 @@ class GNSSSim : public Component {
   uint32_t nmea_delay_us_{100000};
   int satellites_{9};
 
-  bool pps_enabled_{true}, nmea_enabled_{true}, fix_{true}, utc_valid_{true}, answer_ubx_{true};
+  std::atomic<bool> pps_enabled_{true};  // read by the timer callback
+  bool nmea_enabled_{true}, fix_{true}, utc_valid_{true}, answer_ubx_{true};
   bool week_rollover_{false};
   bool glitch_requested_{false};
   std::atomic<int32_t> phase_step_us_{0};
@@ -75,10 +77,13 @@ class GNSSSim : public Component {
   int64_t first_epoch_s_{0};
   int64_t fake_clock_offset_s_{0};
 
-  // Written by the timer callback
-  std::atomic<uint32_t> pulse_count_{0};
-  std::atomic<int64_t> pulse_us_{0};
+  // Written by the timer callback as a pair under pulse_lock_, so loop() never matches a count with
+  // another pulse's time
+  portMUX_TYPE pulse_lock_ = portMUX_INITIALIZER_UNLOCKED;
+  uint32_t pulse_count_{0};
+  int64_t pulse_us_{0};
   uint32_t handled_pulse_{0};
+  int64_t handled_pulse_us_{0};  // loop()'s copy of the time of handled_pulse_
   bool pin_high_{false};
   bool epoch_pending_{false};
   int64_t epoch_due_us_{0};

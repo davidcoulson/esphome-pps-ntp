@@ -1,6 +1,7 @@
 #include "pps_ntp.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -57,6 +58,7 @@ static constexpr double MAX_RATE_ERROR_PPM = 500.0;   // reject fits that imply 
 static constexpr int64_t MAX_PULSE_GAP_S = 600;       // longer gaps are relabelled from NMEA
 static constexpr int64_t FIX_STALE_US = 3000000;      // pulses only count while the receiver reports a fix
 static constexpr int64_t RMC_MAX_DELAY_US = 950000;   // RMC must follow its pulse within this window
+static constexpr double MAX_ALIGN_TOLERANCE_US = 100000;  // an edge further than this from a whole second isn't PPS
 static constexpr uint32_t UBX_POLL_INTERVAL_MS = 10000;
 static constexpr uint32_t UBX_POLL_FAST_MS = 2000;
 static constexpr uint32_t TIMELS_POLL_MS = 60000;
@@ -76,8 +78,22 @@ static constexpr uint32_t ARP_CLIENT_IDLE_MS = 7200000;  // stop priming a clien
 
 static uint16_t get_be16(const uint8_t *p) { return static_cast<uint16_t>((p[0] << 8) | p[1]); }
 
+void map_ipv4(const uint8_t *v4, uint8_t *addr16) {
+  memset(addr16, 0, 10);
+  addr16[10] = addr16[11] = 0xFF;
+  memcpy(addr16 + 12, v4, 4);
+}
+
+void make_rx_key(const uint8_t *transmit_ts, const uint8_t *addr16, uint16_t port, uint8_t *key) {
+  memcpy(key, transmit_ts, 8);
+  key[8] = port >> 8;
+  key[9] = port & 0xFF;
+  memcpy(key + 10, addr16, 16);
+}
+
 bool parse_ntp_request_frame(const uint8_t *frame, uint32_t length, uint16_t port, uint8_t *key) {
   static constexpr uint32_t NTP_LEN = 48;
+  static constexpr uint32_t UDP_HEADER_LEN = 8;
   if (length < 14)
     return false;
   uint32_t off = 12;
@@ -90,7 +106,9 @@ bool parse_ntp_request_frame(const uint8_t *frame, uint32_t length, uint16_t por
   }
   off += 2;
 
-  const uint8_t *udp;
+  // The declared lengths must hold the whole request and fit in the frame; anything past them is padding
+  uint8_t src[16];
+  uint32_t ip_payload;  // bytes after the IP header, as declared
   if (ethertype == 0x0800) {
     if (length < off + 20)
       return false;
@@ -100,6 +118,11 @@ bool parse_ntp_request_frame(const uint8_t *frame, uint32_t length, uint16_t por
       return false;
     if ((get_be16(ip + 6) & 0x3FFF) != 0)
       return false;  // a fragment: only the first carries the UDP header, and NTP requests are never this big
+    uint32_t total = get_be16(ip + 2);
+    if (total < ihl + UDP_HEADER_LEN + NTP_LEN || length < off + total)
+      return false;
+    map_ipv4(ip + 12, src);
+    ip_payload = total - ihl;
     off += ihl;
   } else if (ethertype == 0x86DD) {
     if (length < off + 40)
@@ -107,21 +130,24 @@ bool parse_ntp_request_frame(const uint8_t *frame, uint32_t length, uint16_t por
     const uint8_t *ip = frame + off;
     if ((ip[0] >> 4) != 6 || ip[6] != 17)
       return false;  // extension headers: not worth walking for NTP
+    ip_payload = get_be16(ip + 4);
+    if (ip_payload < UDP_HEADER_LEN + NTP_LEN || length < off + 40 + ip_payload)
+      return false;
+    memcpy(src, ip + 8, 16);
     off += 40;
   } else {
     return false;
   }
-  if (length < off + 8 + NTP_LEN)
+  const uint8_t *udp = frame + off;
+  uint32_t udp_len = get_be16(udp + 4);
+  if (udp_len < UDP_HEADER_LEN + NTP_LEN || udp_len > ip_payload)
     return false;
-  udp = frame + off;
   if (get_be16(udp + 2) != port)
     return false;
-  const uint8_t *ntp = udp + 8;
+  const uint8_t *ntp = udp + UDP_HEADER_LEN;
   if ((ntp[0] & 0x07) != 3)
     return false;
-  memcpy(key, ntp + 40, 8);
-  key[8] = udp[0];  // source port, as sent
-  key[9] = udp[1];
+  make_rx_key(ntp + 40, src, get_be16(udp), key);
   return true;
 }
 
@@ -136,6 +162,12 @@ static int64_t days_from_civil(int y, int m, int d) {
 }
 
 static int two_digits(const char *p) { return (p[0] - '0') * 10 + (p[1] - '0'); }
+
+static int days_in_month(int year, int month) {
+  static const int DAYS[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  bool leap_year = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+  return month == 2 && leap_year ? 29 : DAYS[month - 1];
+}
 
 static bool all_digits(const char *p, int n) {
   for (int i = 0; i < n; i++) {
@@ -260,8 +292,11 @@ void PPSNTPServer::loop() {
     this->last_ubx_poll_ms_ = now_ms;
     this->send_ubx_(0x01, 0x21, nullptr, 0);  // poll UBX-NAV-TIMEUTC for the validUTC flag
   }
-  // Leap-second schedule (u-blox 8 and later; older receivers don't answer, and the leap is then taken from NMEA)
-  if (this->utc_trusted_ && now_ms - this->last_timels_poll_ms_ >= TIMELS_POLL_MS) {
+  // Leap-second schedule (u-blox 8 and later; older receivers don't answer, and the leap is then taken from
+  // NMEA). First asked as soon as UTC is trusted and a pulse is labelled, since the answer needs both.
+  if (this->utc_trusted_ && this->hist_count_ > 0 &&
+      (!this->timels_polled_ || now_ms - this->last_timels_poll_ms_ >= TIMELS_POLL_MS)) {
+    this->timels_polled_ = true;
     this->last_timels_poll_ms_ = now_ms;
     this->send_ubx_(0x01, 0x26, nullptr, 0);
   }
@@ -488,9 +523,23 @@ void PPSNTPServer::note_interrupt_lead_(int64_t hook_us) {
   double lead = static_cast<double>(hook_us) - edge_us;
   if (lead < 0 || lead > 20000)
     return;  // not this frame's edge
-  this->int_lead_sum_us_ += static_cast<int32_t>(lead);
-  this->int_lead_count_++;
+  this->add_sample_(this->int_lead_, static_cast<int32_t>(lead));
 #endif
+}
+
+void PPSNTPServer::add_sample_(IntervalMean &mean, int32_t us) {
+  portENTER_CRITICAL(&this->stats_lock_);
+  mean.sum_us += us;
+  mean.count++;
+  portEXIT_CRITICAL(&this->stats_lock_);
+}
+
+PPSNTPServer::IntervalMean PPSNTPServer::take_samples_(IntervalMean &mean) {
+  portENTER_CRITICAL(&this->stats_lock_);
+  IntervalMean taken = mean;
+  mean = IntervalMean{};
+  portEXIT_CRITICAL(&this->stats_lock_);
+  return taken;
 }
 
 void PPSNTPServer::poll_isr_() {
@@ -562,14 +611,12 @@ void PPSNTPServer::update() {
   if (this->synced_binary_sensor_ != nullptr)
     this->synced_binary_sensor_->publish_state(this->last_synced_);
   // Interval averages; a quiet interval publishes nothing rather than a misleading zero
-  uint32_t gain_n = this->rx_gain_count_.exchange(0);
-  int32_t gain_sum = this->rx_gain_sum_us_.exchange(0);
-  if (this->rx_timestamp_gain_sensor_ != nullptr && gain_n > 0)
-    this->rx_timestamp_gain_sensor_->publish_state(static_cast<float>(gain_sum) / gain_n);
-  uint32_t lead_n = this->int_lead_count_.exchange(0);
-  int32_t lead_sum = this->int_lead_sum_us_.exchange(0);
-  if (this->rx_interrupt_lead_sensor_ != nullptr && lead_n > 0)
-    this->rx_interrupt_lead_sensor_->publish_state(static_cast<float>(lead_sum) / lead_n);
+  IntervalMean gain = this->take_samples_(this->rx_gain_);
+  if (this->rx_timestamp_gain_sensor_ != nullptr && gain.count > 0)
+    this->rx_timestamp_gain_sensor_->publish_state(static_cast<float>(gain.sum_us) / gain.count);
+  IntervalMean lead = this->take_samples_(this->int_lead_);
+  if (this->rx_interrupt_lead_sensor_ != nullptr && lead.count > 0)
+    this->rx_interrupt_lead_sensor_->publish_state(static_cast<float>(lead.sum_us) / lead.count);
   if (this->arp_clients_sensor_ != nullptr) {
     int active = 0;
     for (auto &client : this->arp_clients_)
@@ -705,11 +752,14 @@ void PPSNTPServer::handle_pulse_(double local_us) {
     if (seconds > MAX_PULSE_GAP_S) {
       this->reset_discipline_("PPS gap too long", true);  // the model is only as stale as its holdover
     } else {
+      // An edge within max_residual of a whole second is labelled here and left to the fit's outlier test;
+      // the 100 ppm term covers the rate before the model has one. Past MAX_ALIGN_TOLERANCE_US it is not
+      // the PPS at all, whatever max_residual says.
       double error = elapsed - seconds * rate;
-      double tolerance = 300.0 + 100e-6 * elapsed;
+      double tolerance = std::min(this->max_residual_us_ + 100e-6 * elapsed, MAX_ALIGN_TOLERANCE_US);
       if (std::fabs(error) <= tolerance) {
         this->off_second_edges_ = 0;
-        this->last_pulse_us_ = llround(local_us);
+        this->last_pulse_us_ = local_us;
         this->last_pulse_utc_s_ = this->last_accepted_utc_s_ + seconds;
         this->last_pulse_labelled_ = true;
         this->accept_pulse_(local_us, this->last_pulse_utc_s_);
@@ -725,7 +775,7 @@ void PPSNTPServer::handle_pulse_(double local_us) {
   }
 
   // Candidate: the next valid RMC labels it
-  this->last_pulse_us_ = llround(local_us);
+  this->last_pulse_us_ = local_us;
   this->last_pulse_labelled_ = false;
 }
 
@@ -802,7 +852,7 @@ void PPSNTPServer::accept_pulse_(double local_us, int64_t utc_s) {
   next.anchor_utc_s = utc_s;
   next.local_us_per_s = rate;
   next.last_pulse_local_us = llround(local_us);
-  next.utc_trusted = this->utc_trusted_;
+  next.utc_trusted = this->labels_trusted_();
   this->fill_leap_(next);
   if (next.valid && next.utc_trusted)
     this->ever_synced_.store(true, std::memory_order_relaxed);
@@ -822,9 +872,10 @@ void PPSNTPServer::reset_discipline_(const char *reason, bool keep_time) {
   this->label_mismatches_ = 0;
   this->label_confirmations_ = 0;
   this->off_second_edges_ = 0;
+  this->trusted_confirmations_ = 0;
   this->jitter_sq_us_ = 0;
-  if (this->leap_change_ == 0)
-    this->leap_adj_s_ = 0;  // no history left that was labelled with it
+  // leap_adj_s_ stays: it defines the internal time scale, which a held model's anchor is on, and the
+  // new labels are put on the same scale
   this->relocking_ = keep_time && this->model_.valid;
   if (!this->relocking_) {
     portENTER_CRITICAL(&this->lock_);
@@ -842,10 +893,20 @@ void PPSNTPServer::fill_leap_(ClockModel &model) const {
                         this->leap_midnight_unix_ - now_unix <= LEAP_ANNOUNCE_S;
 }
 
+// The labels can be trusted once RMCs sent while the receiver vouched for its UTC have agreed with them.
+// A fit labelled while UTC was not yet valid can be whole seconds out (leap seconds unknown) and must be
+// re-confirmed, and relabelled if those RMCs disagree, before it serves.
+bool PPSNTPServer::labels_trusted_() const {
+  return this->utc_trusted_ && this->trusted_confirmations_ >= MIN_LABEL_CONFIRMATIONS;
+}
+
 void PPSNTPServer::publish_model_() {
   ClockModel next = this->model_;
-  next.utc_trusted = this->utc_trusted_;
+  // A held model kept its labels' trust from when it was fitted; it can lose it here, not gain it
+  next.utc_trusted = this->relocking_ ? this->utc_trusted_ && this->model_.utc_trusted : this->labels_trusted_();
   this->fill_leap_(next);
+  if (next.valid && next.utc_trusted)
+    this->ever_synced_.store(true, std::memory_order_relaxed);
   portENTER_CRITICAL(&this->lock_);
   this->model_ = next;
   portEXIT_CRITICAL(&this->lock_);
@@ -925,11 +986,14 @@ void PPSNTPServer::feed_byte_(uint8_t byte) {
 }
 
 void PPSNTPServer::handle_nmea_(char *line) {
+  // Exactly two hex digits after the '*', and nothing after them
   char *star = strchr(line, '*');
   uint8_t checksum = 0;
   for (char *p = line + 1; star != nullptr && p < star; p++)
     checksum ^= static_cast<uint8_t>(*p);
-  if (star == nullptr || strlen(star) < 3 || checksum != static_cast<uint8_t>(strtoul(star + 1, nullptr, 16))) {
+  if (star == nullptr || strlen(star) != 3 || !isxdigit(static_cast<unsigned char>(star[1])) ||
+      !isxdigit(static_cast<unsigned char>(star[2])) ||
+      checksum != static_cast<uint8_t>(strtoul(star + 1, nullptr, 16))) {
     this->nmea_bad_++;
     return;
   }
@@ -1009,15 +1073,26 @@ void PPSNTPServer::handle_gga_(char **fields, int count) {
 
 void PPSNTPServer::handle_rmc_(char **fields, int count) {
   int64_t now_us = esp_timer_get_time();
-  if (count < 10 || fields[2][0] != 'A')
+  if (count < 3)
+    return;
+  if (fields[2][0] != 'A') {
+    // The receiver says it has no fix: its pulse is free-running from now on, so stop counting pulses at
+    // once rather than when the last good fix goes stale
+    this->last_rmc_valid_us_ = 0;
+    return;
+  }
+  if (count < 10)
     return;
 
+  // hhmmss, or hhmmss.f+ with an all-zero fraction: only whole-second epochs line up with a pulse
   const char *time = fields[1];
   const char *date = fields[9];
-  if (strlen(time) < 6 || !all_digits(time, 6) || strlen(date) != 6 || !all_digits(date, 6))
+  size_t time_len = strlen(time);
+  if (time_len < 6 || !all_digits(time, 6) || strlen(date) != 6 || !all_digits(date, 6))
     return;
-  // Only whole-second epochs line up with a pulse
-  if (time[6] == '.') {
+  if (time_len > 6) {
+    if (time[6] != '.' || time_len == 7)
+      return;
     for (const char *p = time + 7; *p != '\0'; p++) {
       if (*p != '0')
         return;
@@ -1026,7 +1101,8 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
 
   int day = two_digits(date), month = two_digits(date + 2), year = 2000 + two_digits(date + 4);
   int hour = two_digits(time), minute = two_digits(time + 2), second = two_digits(time + 4);
-  if (day < 1 || day > 31 || month < 1 || month > 12 || hour > 23 || minute > 59 || second > 60)
+  if (month < 1 || month > 12 || day < 1 || day > days_in_month(year, month) || hour > 23 || minute > 59 ||
+      second > 60)
     return;
   bool leap_second_now = second == 60;  // 23:59:60, an inserted leap second in progress
   if (leap_second_now && (hour != 23 || minute != 59))
@@ -1067,7 +1143,7 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
   }
 
   // A u-blox receiver sends the RMC for an epoch shortly after that epoch's pulse
-  int64_t age = now_us - this->last_pulse_us_;
+  double age = static_cast<double>(now_us) - this->last_pulse_us_;
   if (this->last_pulse_us_ == 0 || age <= 0 || age > RMC_MAX_DELAY_US)
     return;
 
@@ -1078,6 +1154,8 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
       this->label_mismatches_ = 0;
       if (this->label_confirmations_ < UINT8_MAX)
         this->label_confirmations_++;
+      if (this->utc_trusted_ && this->trusted_confirmations_ < UINT8_MAX)
+        this->trusted_confirmations_++;
       return;
     }
     if (++this->label_mismatches_ < 3)
@@ -1085,7 +1163,7 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
     this->reset_discipline_("NMEA time disagrees with PPS count", false);
   }
 
-  ESP_LOGD(TAG, "Labelling the pulse from %lld ms ago as unix %lld (from RMC)", static_cast<long long>(age / 1000),
+  ESP_LOGD(TAG, "Labelling the pulse from %lld ms ago as unix %lld (from RMC)", static_cast<long long>(age / 1000.0),
            static_cast<long long>(utc_s));
   this->last_pulse_labelled_ = true;
   this->last_pulse_utc_s_ = utc_s;
@@ -1313,12 +1391,13 @@ void PPSNTPServer::service_baud_switch_() {
 // ---------------------------------------------------------------------------
 // NTP server
 
-bool PPSNTPServer::build_reply_(const uint8_t *request, int64_t rx_local_us, uint16_t src_port, uint8_t *reply) {
+bool PPSNTPServer::build_reply_(const uint8_t *request, int64_t rx_local_us, const uint8_t *src_addr,
+                                uint16_t src_port, uint8_t *reply) {
   uint8_t version = (request[0] >> 3) & 0x07;
   uint8_t mode = request[0] & 0x07;
   if (mode != 3 || version < 1 || version > 4)
     return false;
-  rx_local_us = this->choose_rx_stamp_(request, src_port, rx_local_us);
+  rx_local_us = this->choose_rx_stamp_(request, src_addr, src_port, rx_local_us);
 
   ClockModel model = this->get_model_();
   if (!model.valid && !this->ever_synced_.load(std::memory_order_relaxed))
@@ -1354,54 +1433,69 @@ bool PPSNTPServer::build_reply_(const uint8_t *request, int64_t rx_local_us, uin
   return true;
 }
 
-// Single writer (the Ethernet driver task); readers retry nothing, they just miss on a torn read
+// Single writer (the Ethernet driver task). A reader that overlaps a write sees the sequence change and
+// skips the slot: a miss, so that reply falls back to the stack stamp.
 void PPSNTPServer::rx_record_(const uint8_t *key, int64_t t) {
+  uint32_t words[RX_SLOT_WORDS] = {};
+  memcpy(words, key, RX_KEY_LEN);
+  words[RX_KEY_WORDS] = static_cast<uint32_t>(static_cast<uint64_t>(t));
+  words[RX_KEY_WORDS + 1] = static_cast<uint32_t>(static_cast<uint64_t>(t) >> 32);
   RxStamp &slot = this->rx_ring_[this->rx_ring_next_];
   this->rx_ring_next_ = (this->rx_ring_next_ + 1) % RX_RING;
   uint32_t seq = slot.seq.load(std::memory_order_relaxed);
   slot.seq.store(seq + 1, std::memory_order_relaxed);
   std::atomic_thread_fence(std::memory_order_release);
-  memcpy(slot.key, key, RX_KEY_LEN);
-  slot.t = t;
+  for (int i = 0; i < RX_SLOT_WORDS; i++)
+    slot.words[i].store(words[i], std::memory_order_relaxed);
   slot.seq.store(seq + 2, std::memory_order_release);
 }
 
+// The oldest unused stamp for this key that is recent enough, which is then marked used: a stamp belongs
+// to one request, so a retransmission with the same transmit timestamp takes the next one or none.
 bool PPSNTPServer::rx_lookup_(const uint8_t *key, int64_t now_us, int64_t *t_out) {
+  RxStamp *best = nullptr;
+  uint32_t best_seq = 0;
+  int64_t best_t = 0;
   for (auto &slot : this->rx_ring_) {
     uint32_t before = slot.seq.load(std::memory_order_acquire);
-    if (before == 0 || (before & 1) != 0)
+    if (before == 0 || (before & 1) != 0 || slot.used.load(std::memory_order_relaxed) == before)
       continue;
-    uint8_t slot_key[RX_KEY_LEN];
-    memcpy(slot_key, slot.key, RX_KEY_LEN);
-    int64_t t = slot.t;
+    uint32_t words[RX_SLOT_WORDS];
+    for (int i = 0; i < RX_SLOT_WORDS; i++)
+      words[i] = slot.words[i].load(std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_acquire);
     if (slot.seq.load(std::memory_order_relaxed) != before)
       continue;
-    if (memcmp(slot_key, key, RX_KEY_LEN) == 0 && t <= now_us && now_us - t < RX_STAMP_MAX_AGE_US) {
-      *t_out = t;
-      return true;
+    auto t = static_cast<int64_t>((static_cast<uint64_t>(words[RX_KEY_WORDS + 1]) << 32) | words[RX_KEY_WORDS]);
+    if (memcmp(words, key, RX_KEY_LEN) != 0 || t > now_us || now_us - t >= RX_STAMP_MAX_AGE_US)
+      continue;
+    if (best == nullptr || t < best_t) {
+      best = &slot;
+      best_seq = before;
+      best_t = t;
     }
   }
-  return false;
+  if (best == nullptr || best->used.exchange(best_seq, std::memory_order_relaxed) == best_seq)
+    return false;
+  *t_out = best_t;
+  return true;
 }
 
 // Prefers the driver-level stamp for this request when there is one. The stack stamp is always the later
 // of the two; the difference is what the driver hook buys, reported as rx_timestamp_gain.
-int64_t PPSNTPServer::choose_rx_stamp_(const uint8_t *request, uint16_t src_port, int64_t stack_us) {
+int64_t PPSNTPServer::choose_rx_stamp_(const uint8_t *request, const uint8_t *src_addr, uint16_t src_port,
+                                       int64_t stack_us) {
   if (!this->rx_hook_active_.load(std::memory_order_relaxed))
     return stack_us;
   uint8_t key[RX_KEY_LEN];
-  memcpy(key, request + 40, 8);
-  key[8] = src_port >> 8;
-  key[9] = src_port & 0xFF;
+  make_rx_key(request + 40, src_addr, src_port, key);
   int64_t hook_us;
   if (!this->rx_lookup_(key, stack_us, &hook_us)) {
     this->rx_hook_misses_++;
     return stack_us;
   }
   this->rx_hook_hits_++;
-  this->rx_gain_sum_us_ += static_cast<int32_t>(stack_us - hook_us);
-  this->rx_gain_count_++;
+  this->add_sample_(this->rx_gain_, static_cast<int32_t>(stack_us - hook_us));
   return this->driver_rx_timestamp_.load(std::memory_order_relaxed) ? hook_us : stack_us;
 }
 
@@ -1565,9 +1659,20 @@ void PPSNTPServer::raw_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
   uint8_t request[48];
   if (p != nullptr && p->tot_len >= sizeof(request) &&
       pbuf_copy_partial(p, request, sizeof(request), 0) == sizeof(request)) {
+    uint8_t src[16] = {};
+#if LWIP_IPV4
+    if (IP_IS_V4(addr)) {
+      uint32_t v4 = ip4_addr_get_u32(ip_2_ip4(addr));  // network byte order
+      map_ipv4(reinterpret_cast<const uint8_t *>(&v4), src);
+    }
+#endif
+#if LWIP_IPV6
+    if (IP_IS_V6(addr))
+      memcpy(src, ip_2_ip6(addr)->addr, 16);
+#endif
     struct pbuf *out = pbuf_alloc(PBUF_TRANSPORT, 48, PBUF_RAM);
     if (out != nullptr) {
-      if (self->build_reply_(request, rx_local, port, static_cast<uint8_t *>(out->payload))) {
+      if (self->build_reply_(request, rx_local, src, port, static_cast<uint8_t *>(out->payload))) {
         udp_sendto(pcb, out, addr, port);
 #if LWIP_IPV4
         if (IP_IS_V4(addr))
@@ -1629,20 +1734,22 @@ void PPSNTPServer::ntp_loop_() {
         continue;
       uint8_t reply[48];
       uint16_t src_port;
+      uint8_t src[16];      // IPv4 as ::ffff:a.b.c.d, the form the dual-stack socket reports it in
       uint32_t src_v4 = 0;  // network byte order; 0 = not IPv4
 #if LWIP_IPV6
       const auto *src6 = reinterpret_cast<const struct sockaddr_in6 *>(&source);
       src_port = ntohs(src6->sin6_port);
-      const uint8_t *a = reinterpret_cast<const uint8_t *>(&src6->sin6_addr);
+      memcpy(src, &src6->sin6_addr, 16);
       static const uint8_t V4_MAPPED[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
-      if (memcmp(a, V4_MAPPED, 12) == 0)
-        memcpy(&src_v4, a + 12, 4);
+      if (memcmp(src, V4_MAPPED, 12) == 0)
+        memcpy(&src_v4, src + 12, 4);
 #else
       const auto *src4 = reinterpret_cast<const struct sockaddr_in *>(&source);
       src_port = ntohs(src4->sin_port);
       src_v4 = src4->sin_addr.s_addr;
+      map_ipv4(reinterpret_cast<const uint8_t *>(&src_v4), src);
 #endif
-      if (this->build_reply_(request, rx_local, src_port, reply)) {
+      if (this->build_reply_(request, rx_local, src, src_port, reply)) {
         sendto(sock, reply, sizeof(reply), 0, reinterpret_cast<struct sockaddr *>(&source), source_len);
         this->note_client_ipv4_(src_v4);
       }
