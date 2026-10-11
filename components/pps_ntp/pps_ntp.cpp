@@ -523,9 +523,23 @@ void PPSNTPServer::note_interrupt_lead_(int64_t hook_us) {
   double lead = static_cast<double>(hook_us) - edge_us;
   if (lead < 0 || lead > 20000)
     return;  // not this frame's edge
-  this->int_lead_sum_us_ += static_cast<int32_t>(lead);
-  this->int_lead_count_++;
+  this->add_sample_(this->int_lead_, static_cast<int32_t>(lead));
 #endif
+}
+
+void PPSNTPServer::add_sample_(IntervalMean &mean, int32_t us) {
+  portENTER_CRITICAL(&this->stats_lock_);
+  mean.sum_us += us;
+  mean.count++;
+  portEXIT_CRITICAL(&this->stats_lock_);
+}
+
+PPSNTPServer::IntervalMean PPSNTPServer::take_samples_(IntervalMean &mean) {
+  portENTER_CRITICAL(&this->stats_lock_);
+  IntervalMean taken = mean;
+  mean = IntervalMean{};
+  portEXIT_CRITICAL(&this->stats_lock_);
+  return taken;
 }
 
 void PPSNTPServer::poll_isr_() {
@@ -597,14 +611,12 @@ void PPSNTPServer::update() {
   if (this->synced_binary_sensor_ != nullptr)
     this->synced_binary_sensor_->publish_state(this->last_synced_);
   // Interval averages; a quiet interval publishes nothing rather than a misleading zero
-  uint32_t gain_n = this->rx_gain_count_.exchange(0);
-  int32_t gain_sum = this->rx_gain_sum_us_.exchange(0);
-  if (this->rx_timestamp_gain_sensor_ != nullptr && gain_n > 0)
-    this->rx_timestamp_gain_sensor_->publish_state(static_cast<float>(gain_sum) / gain_n);
-  uint32_t lead_n = this->int_lead_count_.exchange(0);
-  int32_t lead_sum = this->int_lead_sum_us_.exchange(0);
-  if (this->rx_interrupt_lead_sensor_ != nullptr && lead_n > 0)
-    this->rx_interrupt_lead_sensor_->publish_state(static_cast<float>(lead_sum) / lead_n);
+  IntervalMean gain = this->take_samples_(this->rx_gain_);
+  if (this->rx_timestamp_gain_sensor_ != nullptr && gain.count > 0)
+    this->rx_timestamp_gain_sensor_->publish_state(static_cast<float>(gain.sum_us) / gain.count);
+  IntervalMean lead = this->take_samples_(this->int_lead_);
+  if (this->rx_interrupt_lead_sensor_ != nullptr && lead.count > 0)
+    this->rx_interrupt_lead_sensor_->publish_state(static_cast<float>(lead.sum_us) / lead.count);
   if (this->arp_clients_sensor_ != nullptr) {
     int active = 0;
     for (auto &client : this->arp_clients_)
@@ -1483,8 +1495,7 @@ int64_t PPSNTPServer::choose_rx_stamp_(const uint8_t *request, const uint8_t *sr
     return stack_us;
   }
   this->rx_hook_hits_++;
-  this->rx_gain_sum_us_ += static_cast<int32_t>(stack_us - hook_us);
-  this->rx_gain_count_++;
+  this->add_sample_(this->rx_gain_, static_cast<int32_t>(stack_us - hook_us));
   return this->driver_rx_timestamp_.load(std::memory_order_relaxed) ? hook_us : stack_us;
 }
 

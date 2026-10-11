@@ -148,8 +148,17 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void rx_record_(const uint8_t *key, int64_t t);
   bool rx_lookup_(const uint8_t *key, int64_t now_us, int64_t *t_out);
   int64_t choose_rx_stamp_(const uint8_t *request, const uint8_t *src_addr, uint16_t src_port, int64_t stack_us);
-  std::atomic<int32_t> rx_gain_sum_us_{0};
-  std::atomic<uint32_t> rx_gain_count_{0};
+  // A sum and count over one update interval: added to by the serving context or the driver task, taken
+  // by update(). The pair moves together under stats_lock_, so no sample is split across two intervals.
+  struct IntervalMean {
+    int32_t sum_us{0};
+    uint32_t count{0};
+  };
+  IntervalMean rx_gain_;   // stack stamp - driver stamp
+  IntervalMean int_lead_;  // driver stamp - Ethernet interrupt edge
+  portMUX_TYPE stats_lock_ = portMUX_INITIALIZER_UNLOCKED;
+  void add_sample_(IntervalMean &mean, int32_t us);
+  IntervalMean take_samples_(IntervalMean &mean);  // returns the interval's pair and starts a new one
   void measure_precision_();
   uint32_t last_int_value_{0};
   // Ties the capture counter to esp_timer: the midpoint of two clock reads around a software latch.
@@ -373,8 +382,6 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   sensor::Sensor *rx_timestamp_gain_sensor_{nullptr};
   sensor::Sensor *rx_interrupt_lead_sensor_{nullptr};
   sensor::Sensor *arp_clients_sensor_{nullptr};
-  std::atomic<int32_t> int_lead_sum_us_{0};
-  std::atomic<uint32_t> int_lead_count_{0};
   sensor::Sensor *frequency_offset_sensor_{nullptr};
   sensor::Sensor *pps_jitter_sensor_{nullptr};
   sensor::Sensor *requests_sensor_{nullptr};

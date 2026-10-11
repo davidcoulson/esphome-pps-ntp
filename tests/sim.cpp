@@ -591,14 +591,17 @@ int main(int argc, char **argv) {
     s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1234, rep);
     printf("    stack T2 - hook T2 = %.1f us\n", off_stack(stack_t2));
     check(std::fabs(off_stack(stack_t2) - 700) < 2, "T2 taken from the driver stamp");
-    check(s.rx_hook_hits_ == 1 && s.rx_gain_count_ == 1 && s.rx_gain_sum_us_ == 700, "gain recorded");
+    check(s.rx_hook_hits_ == 1 && s.rx_gain_.count == 1 && s.rx_gain_.sum_us == 700, "gain recorded");
     s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1234, rep);
     check(std::fabs(off_stack(stack_t2)) < 2 && s.rx_hook_misses_ == 1, "a stamp serves one request: a repeat falls back");
     s.rx_record_(k, g_now_us - 700);
     s.set_driver_rx_timestamp(false);
     s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1234, rep);
     check(std::fabs(off_stack(stack_t2)) < 2, "switch off: stack stamp used, gain still measured");
-    check(s.rx_gain_count_ == 2, "second gain sample");
+    check(s.rx_gain_.count == 2, "second gain sample");
+    sensor::Sensor gain_sensor; s.set_rx_timestamp_gain_sensor(&gain_sensor); s.update();
+    check(gain_sensor.state == 700 && s.rx_gain_.count == 0 && s.rx_gain_.sum_us == 0,
+          "update() publishes the interval mean and starts a new interval");
     s.set_driver_rx_timestamp(true);
     s.rx_record_(k, g_now_us - 700);
     s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1235, rep);
