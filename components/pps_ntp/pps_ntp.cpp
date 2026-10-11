@@ -434,6 +434,7 @@ void PPSNTPServer::poll_capture_() {
 
   // The 32-bit counter wraps every ~53 s (80 MHz); the signed difference is valid for ~26 s
   int32_t ticks_since_edge = static_cast<int32_t>(ref_ticks - pulse_ticks);
+  this->diag_since_edge_us_ = ticks_since_edge / this->cap_ticks_per_us_;
   this->handle_pulse_(ref_us - ticks_since_edge / this->cap_ticks_per_us_);
 #endif
 }
@@ -493,6 +494,7 @@ void PPSNTPServer::sample_ref_(uint32_t *ticks, double *us) {
     uint64_t after = esp_timer_impl_get_counter_reg();
     mcpwm_capture_get_latched_value(this->cap_ref_, ticks);
     portEXIT_CRITICAL(&this->ref_lock_);
+    this->diag_latch_ticks_ = static_cast<uint32_t>(after - before);
     // Every other stamp (NTP receive and transmit, the driver hook) is a whole-µs esp_timer_get_time(),
     // which truncates: on average it reads (ticks_per_us - 1) / (2 ticks_per_us) µs (0.47 µs at 16 MHz)
     // before the exact counter time. Put the edges on that same scale, or the model maps every stamp
@@ -772,6 +774,7 @@ void PPSNTPServer::handle_pulse_(double local_us) {
         this->last_pulse_us_ = local_us;
         this->last_pulse_utc_s_ = this->last_accepted_utc_s_ + seconds;
         this->last_pulse_labelled_ = true;
+        this->diag_src_ = 1;
         this->accept_pulse_(local_us, this->last_pulse_utc_s_);
         return;
       }
@@ -798,6 +801,10 @@ void PPSNTPServer::accept_pulse_(double local_us, int64_t utc_s) {
     double predicted = this->model_.anchor_local_us + (utc_s - this->model_.anchor_utc_s) * this->model_.local_us_per_s;
     double residual = local_us - predicted;
     this->last_residual_us_ = residual;
+    if (std::fabs(residual) > 0.3)
+      ESP_LOGW(TAG, "DIAG resid=%.3f utc=%lld src=%d latch=%u since_edge=%.1fus local=%.3f pred=%.3f n=%d rate=%.4f",
+               residual, (long long) utc_s, this->diag_src_, (unsigned) this->diag_latch_ticks_,
+               this->diag_since_edge_us_, local_us, predicted, this->hist_count_, this->model_.local_us_per_s);
     if (std::fabs(residual) > this->max_residual_us_) {
       if (++this->outliers_ < 3) {
         ESP_LOGW(TAG, "PPS pulse %.0f µs from prediction; ignoring", residual);
@@ -1177,6 +1184,7 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
            static_cast<long long>(utc_s));
   this->last_pulse_labelled_ = true;
   this->last_pulse_utc_s_ = utc_s;
+  this->diag_src_ = 2;
   this->accept_pulse_(this->last_pulse_us_, utc_s);
 }
 

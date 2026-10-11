@@ -170,6 +170,9 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   double diag_cal_ratio_{0};
   int diag_cal_fail_{-2};  // DIAG: -2 not run, -1 passed, >=0 failing read index, 99 ratio
   int64_t diag_b_{0}, diag_u_{0}, diag_a_{0};
+  uint32_t diag_latch_ticks_{0};
+  double diag_since_edge_us_{0};
+  int diag_src_{0};  // 1 counted, 2 RMC
   void note_interrupt_lead_(int64_t hook_us);
   std::atomic<bool> rx_hook_active_{false};
   std::atomic<bool> driver_rx_timestamp_{true};
