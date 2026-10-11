@@ -1,5 +1,5 @@
 # Must be REJECTED: rx_reference_pin needs MCPWM capture, which needs ESP-IDF 6.0+. Same as
-# s3-socket.yaml but on the default (5.5) framework.
+# s3-socket.yaml but pinned to ESP-IDF 5.5, so it keeps testing this when ESPHome's default moves on.
 esphome:
   name: ci-s3-idf55-rxref
 esp32:
@@ -7,6 +7,7 @@ esp32:
   flash_size: 16MB
   framework:
     type: esp-idf
+    version: 5.5.5
 external_components:
   - source:
       type: local

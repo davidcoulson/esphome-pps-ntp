@@ -8,6 +8,19 @@ Hardware status: run on an ESP32-S3-ETH against the `gnss_sim` emulator. Not yet
 - `max_residual` defaults to 200 µs only with MCPWM hardware capture. The GPIO interrupt, including the IDF < 6 fallback added in v0.8.1, gets 1000 µs again, because its latency can exceed 200 µs for several pulses running while flash is busy, which dropped the server to stratum 16. An explicit `max_residual` is used as given.
 - The "has ever synchronised" flag the reply path reads from the NTP task is now atomic.
 - Host tests for `rx_delay` / `tx_delay`, the `max_residual` default and the counter-to-stamp scale.
+- Fix: a fit labelled from NMEA while the receiver's UTC was not yet valid was served at stratum 1 the moment NAV-TIMEUTC confirmed UTC, without checking its labels. On a cold start with NMEA whole seconds off, that served time two seconds wrong for about a second, until three RMC disagreements reset it. The labels now need 3 RMC confirmations sent after UTC was confirmed; if those disagree, the fit is relabelled first.
+- Fix: an RMC with status `V` now stops pulses entering the fit at once. Before, up to 3 more free-running pulses were used until the last good fix went stale.
+- Fix: after a leap second, a PPS gap long enough to relabel (over 600 s) reset the leap adjustment while the held-over model still used it, so any republish during the relock (a NAV-TIMEUTC or NAV-TIMELS answer) served time a second off. The adjustment is now kept.
+- Fix: an edge is accepted as on the second within `max_residual` of it (plus 100 ppm of the time since the last pulse), capped at 100 ms. The fixed 300 µs gate reset the discipline on three GPIO edges 400-1000 µs late, inside the 1000 µs interrupt default.
+- Fix: a model that becomes trusted between pulses now marks the server as having synchronised, so a lost lock right after answers stratum 16 rather than nothing.
+- Fix: with MCPWM capture, a pulse relabelled after an RMC disagreement was counted as accepted twice (sub-µs time against its rounded copy), which could underflow `rejected_pulses`. The candidate pulse keeps its exact time, which also keeps its sub-µs precision.
+- NMEA parsing is stricter: the checksum must be exactly two hex digits at the end of the sentence, RMC times must be `hhmmss` or `hhmmss.` followed by zeros, and dates must exist (29 February 2026 was read as 1 March).
+- Driver-level receive stamps: the key now includes the client's address as well as its transmit timestamp and port, each stamp answers one request, and the ring's payload is read and written as atomics inside its seqlock (it was formally a data race). Frames are checked against their declared IP and UDP lengths.
+- `UBX-NAV-TIMELS` is polled as soon as UTC is trusted, rather than first at a minute after boot.
+- Validation rejects `enable_lwip_tcpip_core_locking: false` (and `CONFIG_LWIP_TCPIP_CORE_LOCKING: n`): the ARP refresh and `raw_lwip` call lwIP from the main loop and need that lock.
+- README and the example now pin v0.8.1 (v0.7.0 doesn't build on IDF 5.5).
+- `tools/ntpprobe.py` only counts a reply from the server it asked, of full length, echoing its transmit timestamp, and handles NTP timestamps past the 2036 rollover.
+- Tests: new scenarios for each fix above. The simulated receiver now keeps sending NMEA without PPS; scenario I really free-runs the pulses; J and J2 send RMCs before PPS returns, so the long-gap relock path runs; L and M fail on any drop to stratum 16. `invalid-rx-reference-idf55.yaml` pins ESP-IDF 5.5.5 instead of relying on ESPHome's default.
 
 ## v0.8.1 - 2026-09-29
 - MCPWM hardware capture now needs ESP-IDF 6.0 or newer, which is where `mcpwm_capture_get_latched_value()` first appears. On an older framework the component falls back to the GPIO interrupt with a compile-time warning instead of failing to build, and `rx_reference_pin` is rejected with a clear message. Builds on IDF 6.x are unchanged. Every release since v0.7.0 failed to compile on IDF 5.5.
