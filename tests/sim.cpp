@@ -181,7 +181,7 @@ struct Sim : PPSNTPServer {
 
   void query(bool check) {
     uint8_t req[48] = {0x23}, rep[48];
-    if (!this->build_reply_(req, g_now_us, 0, rep)) { silent++; return; }
+    if (!this->build_reply_(req, g_now_us, CLIENT, 0, rep)) { silent++; return; }
     if (rep[1] != 1) { unsynced++; return; }
     li_seen[rep[0] >> 6]++;
     served++;
@@ -520,18 +520,34 @@ int main(int argc, char **argv) {
 
   begin("P. Driver-level receive stamps (frame parsing, lookup, fallback)");
   {
-    // Ethernet + IPv4 + UDP + NTP client request from port 50123 to 123
+    // Ethernet + IPv4 + UDP + NTP client request from 198.51.100.7 port 50123 to 123, with real lengths
+    auto put16 = [](uint8_t *p, uint32_t v) { p[0] = v >> 8; p[1] = v & 0xFF; };
     uint8_t f[14 + 20 + 8 + 48] = {};
     f[12] = 0x08; f[13] = 0x00;
-    uint8_t *ip = f + 14; ip[0] = 0x45; ip[9] = 17;
-    uint8_t *udp = ip + 20; udp[0] = 50123 >> 8; udp[1] = 50123 & 0xFF; udp[2] = 0; udp[3] = 123;
+    uint8_t *ip = f + 14; ip[0] = 0x45; ip[9] = 17; put16(ip + 2, 20 + 8 + 48);
+    ip[12] = 198; ip[13] = 51; ip[14] = 100; ip[15] = 7;
+    uint8_t *udp = ip + 20; put16(udp, 50123); put16(udp + 2, 123); put16(udp + 4, 8 + 48);
     uint8_t *ntp = udp + 8; ntp[0] = 0x23;
     for (int i = 0; i < 8; i++) ntp[40 + i] = 0xA0 + i;
     uint8_t key[RX_KEY_LEN];
+    static const uint8_t MAPPED[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 198, 51, 100, 7};
     check(parse_ntp_request_frame(f, sizeof(f), 123, key) && key[0] == 0xA0 && key[7] == 0xA7 &&
-              key[8] == (50123 >> 8) && key[9] == (50123 & 0xFF), "IPv4 request parsed, key = transmit ts + src port");
+              key[8] == (50123 >> 8) && key[9] == (50123 & 0xFF) && memcmp(key + 10, MAPPED, 16) == 0,
+          "IPv4 request parsed, key = transmit ts + src port + src address (v4-mapped)");
     check(!parse_ntp_request_frame(f, sizeof(f), 124, key), "other destination port ignored");
     check(!parse_ntp_request_frame(f, sizeof(f) - 1, 123, key), "truncated frame ignored");
+    uint8_t padded[sizeof(f) + 10] = {};
+    memcpy(padded, f, sizeof(f));
+    check(parse_ntp_request_frame(padded, sizeof(padded), 123, key), "Ethernet padding past the IP length ignored");
+    put16(ip + 2, 20 + 8 + 40);
+    check(!parse_ntp_request_frame(f, sizeof(f), 123, key), "IPv4 total length too short for a request ignored");
+    put16(ip + 2, 20 + 8 + 48 + 1);
+    check(!parse_ntp_request_frame(f, sizeof(f), 123, key), "IPv4 total length past the frame ignored");
+    put16(ip + 2, 20 + 8 + 48); put16(udp + 4, 8);
+    check(!parse_ntp_request_frame(f, sizeof(f), 123, key), "UDP length too short for a request ignored");
+    put16(udp + 4, 8 + 48 + 1);
+    check(!parse_ntp_request_frame(f, sizeof(f), 123, key), "UDP length past the IP payload ignored");
+    put16(udp + 4, 8 + 48);
     ntp[0] = 0x24;
     check(!parse_ntp_request_frame(f, sizeof(f), 123, key), "server-mode packet ignored");
     ntp[0] = 0x23; ip[6] = 0x20;  // MF
@@ -540,9 +556,15 @@ int main(int argc, char **argv) {
     check(parse_ntp_request_frame(f, sizeof(f), 123, key), "DF set still parsed");
 
     uint8_t v[14 + 40 + 8 + 48] = {};
-    v[12] = 0x86; v[13] = 0xDD; v[14] = 0x60; v[14 + 6] = 17;
-    uint8_t *vu = v + 54; vu[1] = 77; vu[3] = 123; vu[8] = 0x23; vu[8 + 40] = 0x55;
-    check(parse_ntp_request_frame(v, sizeof(v), 123, key) && key[0] == 0x55 && key[9] == 77, "IPv6 request parsed");
+    v[12] = 0x86; v[13] = 0xDD; v[14] = 0x60; put16(v + 14 + 4, 8 + 48); v[14 + 6] = 17;
+    v[14 + 8] = 0x20; v[14 + 9] = 0x01; v[14 + 23] = 0x42;  // source 2001::42
+    uint8_t *vu = v + 54; put16(vu, 77); put16(vu + 2, 123); put16(vu + 4, 8 + 48); vu[8] = 0x23; vu[8 + 40] = 0x55;
+    check(parse_ntp_request_frame(v, sizeof(v), 123, key) && key[0] == 0x55 && key[9] == 77 && key[10] == 0x20 &&
+              key[11] == 0x01 && key[25] == 0x42,
+          "IPv6 request parsed, with its source address");
+    put16(v + 14 + 4, 8 + 40);
+    check(!parse_ntp_request_frame(v, sizeof(v), 123, key), "IPv6 payload length too short for a request ignored");
+    put16(v + 14 + 4, 8 + 48);
     v[14 + 6] = 0;  // hop-by-hop extension header
     check(!parse_ntp_request_frame(v, sizeof(v), 123, key), "IPv6 with extension headers ignored");
 
@@ -554,32 +576,49 @@ int main(int argc, char **argv) {
     check(s.served > 0, "synced");
     uint8_t req[48] = {0x23}, rep[48];
     for (int i = 0; i < 8; i++) req[40 + i] = 0x10 + i;
-    uint8_t k[RX_KEY_LEN]; memcpy(k, req + 40, 8); k[8] = 0x12; k[9] = 0x34;
+    uint8_t k[RX_KEY_LEN]; make_rx_key(req + 40, Sim::CLIENT, 0x1234, k);
+    uint8_t other_client[16]; memcpy(other_client, Sim::CLIENT, 16); other_client[15] = 2;
     auto t2_us = [&](const uint8_t *r) {
       uint32_t sec = (r[32] << 24) | (r[33] << 16) | (r[34] << 8) | r[35];
       uint32_t frac = (r[36] << 24) | (r[37] << 16) | (r[38] << 8) | r[39];
       return (static_cast<long double>(sec) - 2208988800.0L) * 1e6L + frac * 1e6L / 4294967296.0L;
     };
-    s.build_reply_(req, g_now_us, 0x1234, rep);
+    auto off_stack = [&](long double stack) { return static_cast<double>(stack - t2_us(rep)); };
+    s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1234, rep);
     long double stack_t2 = t2_us(rep);
     s.rx_hook_active_ = true;
     s.rx_record_(k, g_now_us - 700);
-    s.build_reply_(req, g_now_us, 0x1234, rep);
-    long double hook_t2 = t2_us(rep);
-    printf("    stack T2 - hook T2 = %.1f us\n", static_cast<double>(stack_t2 - hook_t2));
-    check(std::fabs(static_cast<double>(stack_t2 - hook_t2) - 700) < 2, "T2 taken from the driver stamp");
+    s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1234, rep);
+    printf("    stack T2 - hook T2 = %.1f us\n", off_stack(stack_t2));
+    check(std::fabs(off_stack(stack_t2) - 700) < 2, "T2 taken from the driver stamp");
     check(s.rx_hook_hits_ == 1 && s.rx_gain_count_ == 1 && s.rx_gain_sum_us_ == 700, "gain recorded");
+    s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1234, rep);
+    check(std::fabs(off_stack(stack_t2)) < 2 && s.rx_hook_misses_ == 1, "a stamp serves one request: a repeat falls back");
+    s.rx_record_(k, g_now_us - 700);
     s.set_driver_rx_timestamp(false);
-    s.build_reply_(req, g_now_us, 0x1234, rep);
-    check(std::fabs(static_cast<double>(t2_us(rep) - stack_t2)) < 2, "switch off: stack stamp used, gain still measured");
+    s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1234, rep);
+    check(std::fabs(off_stack(stack_t2)) < 2, "switch off: stack stamp used, gain still measured");
     check(s.rx_gain_count_ == 2, "second gain sample");
     s.set_driver_rx_timestamp(true);
-    s.build_reply_(req, g_now_us, 0x1235, rep);
-    check(std::fabs(static_cast<double>(t2_us(rep) - stack_t2)) < 2 && s.rx_hook_misses_ == 1,
+    s.rx_record_(k, g_now_us - 700);
+    s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1235, rep);
+    check(std::fabs(off_stack(stack_t2)) < 2 && s.rx_hook_misses_ == 2,
           "different source port: no match, falls back to the stack stamp");
+    s.build_reply_(req, g_now_us, other_client, 0x1234, rep);
+    check(std::fabs(off_stack(stack_t2)) < 2 && s.rx_hook_misses_ == 3,
+          "another client with the same transmit timestamp and port: no match");
+    s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1234, rep);
+    check(std::fabs(off_stack(stack_t2) - 700) < 2, "the right client still finds its stamp");
+    s.rx_record_(k, g_now_us - 900); s.rx_record_(k, g_now_us - 500);  // a retransmitted request
+    s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1234, rep);
+    double first = off_stack(stack_t2);
+    s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1234, rep);
+    check(std::fabs(first - 900) < 2 && std::fabs(off_stack(stack_t2) - 500) < 2,
+          "two copies of one request take one stamp each, oldest first");
+    s.rx_record_(k, g_now_us);
     s.run(1);  // the stamp is now a second old
     uint32_t hits = s.rx_hook_hits_;
-    s.build_reply_(req, g_now_us, 0x1234, rep);
+    s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1234, rep);
     check(s.rx_hook_hits_ == hits, "stale stamp not used");
     for (int i = 0; i < 20; i++) { uint8_t other[RX_KEY_LEN] = {static_cast<uint8_t>(i)}; s.rx_record_(other, g_now_us); }
     check(s.rx_ring_[0].seq.load() % 2 == 0, "ring slots settle on even sequence numbers");
@@ -588,7 +627,7 @@ int main(int argc, char **argv) {
     uint32_t disp = (rep[8] << 24) | (rep[9] << 16) | (rep[10] << 8) | rep[11];
     check(disp >= 16 && disp <= 17, "root dispersion defaults to 250 us (+ drift since the last pulse)");
     Sim d; d.set_root_dispersion_us(1000); d.setup(); d.run(30);
-    d.build_reply_(req, g_now_us, 0, rep);
+    d.build_reply_(req, g_now_us, Sim::CLIENT, 0, rep);
     disp = (rep[8] << 24) | (rep[9] << 16) | (rep[10] << 8) | rep[11];
     check(disp >= 65 && disp <= 66, "root dispersion configurable");
   }
@@ -645,18 +684,18 @@ int main(int argc, char **argv) {
     Sim s; s.setup(); s.run(30);
     check(s.served > 0, "synced");
     uint8_t req[48] = {0x23}, rep[48];
-    s.build_reply_(req, g_now_us, 0, rep);
+    s.build_reply_(req, g_now_us, Sim::CLIENT, 0, rep);
     long double t2 = ts_us(rep + 32), t3 = ts_us(rep + 40);
     s.set_rx_delay_us(30); s.set_tx_delay_us(20);
-    s.build_reply_(req, g_now_us, 0, rep);
+    s.build_reply_(req, g_now_us, Sim::CLIENT, 0, rep);
     printf("    T2 moved %.2f us, T3 moved %.2f us\n", static_cast<double>(ts_us(rep + 32) - t2),
            static_cast<double>(ts_us(rep + 40) - t3));
     check(std::fabs(static_cast<double>(ts_us(rep + 32) - t2) + 30) < 0.01, "rx_delay taken off T2");
     check(std::fabs(static_cast<double>(ts_us(rep + 40) - t3) - 20) < 0.01, "tx_delay added to T3");
     s.rx_hook_active_ = true;
-    uint8_t k[RX_KEY_LEN] = {}; k[8] = 0x12; k[9] = 0x34;
+    uint8_t k[RX_KEY_LEN]; make_rx_key(req + 40, Sim::CLIENT, 0x1234, k);
     s.rx_record_(k, g_now_us - 700);
-    s.build_reply_(req, g_now_us, 0x1234, rep);
+    s.build_reply_(req, g_now_us, Sim::CLIENT, 0x1234, rep);
     check(std::fabs(static_cast<double>(ts_us(rep + 32) - t2) + 730) < 0.01, "rx_delay also taken off a driver stamp");
 
     check(s.max_residual_us_ == 1000.0, "GPIO interrupt capture: max_residual defaults to 1000 us");

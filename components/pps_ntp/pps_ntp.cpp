@@ -78,8 +78,22 @@ static constexpr uint32_t ARP_CLIENT_IDLE_MS = 7200000;  // stop priming a clien
 
 static uint16_t get_be16(const uint8_t *p) { return static_cast<uint16_t>((p[0] << 8) | p[1]); }
 
+void map_ipv4(const uint8_t *v4, uint8_t *addr16) {
+  memset(addr16, 0, 10);
+  addr16[10] = addr16[11] = 0xFF;
+  memcpy(addr16 + 12, v4, 4);
+}
+
+void make_rx_key(const uint8_t *transmit_ts, const uint8_t *addr16, uint16_t port, uint8_t *key) {
+  memcpy(key, transmit_ts, 8);
+  key[8] = port >> 8;
+  key[9] = port & 0xFF;
+  memcpy(key + 10, addr16, 16);
+}
+
 bool parse_ntp_request_frame(const uint8_t *frame, uint32_t length, uint16_t port, uint8_t *key) {
   static constexpr uint32_t NTP_LEN = 48;
+  static constexpr uint32_t UDP_HEADER_LEN = 8;
   if (length < 14)
     return false;
   uint32_t off = 12;
@@ -92,7 +106,9 @@ bool parse_ntp_request_frame(const uint8_t *frame, uint32_t length, uint16_t por
   }
   off += 2;
 
-  const uint8_t *udp;
+  // The declared lengths must hold the whole request and fit in the frame; anything past them is padding
+  uint8_t src[16];
+  uint32_t ip_payload;  // bytes after the IP header, as declared
   if (ethertype == 0x0800) {
     if (length < off + 20)
       return false;
@@ -102,6 +118,11 @@ bool parse_ntp_request_frame(const uint8_t *frame, uint32_t length, uint16_t por
       return false;
     if ((get_be16(ip + 6) & 0x3FFF) != 0)
       return false;  // a fragment: only the first carries the UDP header, and NTP requests are never this big
+    uint32_t total = get_be16(ip + 2);
+    if (total < ihl + UDP_HEADER_LEN + NTP_LEN || length < off + total)
+      return false;
+    map_ipv4(ip + 12, src);
+    ip_payload = total - ihl;
     off += ihl;
   } else if (ethertype == 0x86DD) {
     if (length < off + 40)
@@ -109,21 +130,24 @@ bool parse_ntp_request_frame(const uint8_t *frame, uint32_t length, uint16_t por
     const uint8_t *ip = frame + off;
     if ((ip[0] >> 4) != 6 || ip[6] != 17)
       return false;  // extension headers: not worth walking for NTP
+    ip_payload = get_be16(ip + 4);
+    if (ip_payload < UDP_HEADER_LEN + NTP_LEN || length < off + 40 + ip_payload)
+      return false;
+    memcpy(src, ip + 8, 16);
     off += 40;
   } else {
     return false;
   }
-  if (length < off + 8 + NTP_LEN)
+  const uint8_t *udp = frame + off;
+  uint32_t udp_len = get_be16(udp + 4);
+  if (udp_len < UDP_HEADER_LEN + NTP_LEN || udp_len > ip_payload)
     return false;
-  udp = frame + off;
   if (get_be16(udp + 2) != port)
     return false;
-  const uint8_t *ntp = udp + 8;
+  const uint8_t *ntp = udp + UDP_HEADER_LEN;
   if ((ntp[0] & 0x07) != 3)
     return false;
-  memcpy(key, ntp + 40, 8);
-  key[8] = udp[0];  // source port, as sent
-  key[9] = udp[1];
+  make_rx_key(ntp + 40, src, get_be16(udp), key);
   return true;
 }
 
@@ -1355,12 +1379,13 @@ void PPSNTPServer::service_baud_switch_() {
 // ---------------------------------------------------------------------------
 // NTP server
 
-bool PPSNTPServer::build_reply_(const uint8_t *request, int64_t rx_local_us, uint16_t src_port, uint8_t *reply) {
+bool PPSNTPServer::build_reply_(const uint8_t *request, int64_t rx_local_us, const uint8_t *src_addr,
+                                uint16_t src_port, uint8_t *reply) {
   uint8_t version = (request[0] >> 3) & 0x07;
   uint8_t mode = request[0] & 0x07;
   if (mode != 3 || version < 1 || version > 4)
     return false;
-  rx_local_us = this->choose_rx_stamp_(request, src_port, rx_local_us);
+  rx_local_us = this->choose_rx_stamp_(request, src_addr, src_port, rx_local_us);
 
   ClockModel model = this->get_model_();
   if (!model.valid && !this->ever_synced_.load(std::memory_order_relaxed))
@@ -1396,46 +1421,62 @@ bool PPSNTPServer::build_reply_(const uint8_t *request, int64_t rx_local_us, uin
   return true;
 }
 
-// Single writer (the Ethernet driver task); readers retry nothing, they just miss on a torn read
+// Single writer (the Ethernet driver task). A reader that overlaps a write sees the sequence change and
+// skips the slot: a miss, so that reply falls back to the stack stamp.
 void PPSNTPServer::rx_record_(const uint8_t *key, int64_t t) {
+  uint32_t words[RX_SLOT_WORDS] = {};
+  memcpy(words, key, RX_KEY_LEN);
+  words[RX_KEY_WORDS] = static_cast<uint32_t>(static_cast<uint64_t>(t));
+  words[RX_KEY_WORDS + 1] = static_cast<uint32_t>(static_cast<uint64_t>(t) >> 32);
   RxStamp &slot = this->rx_ring_[this->rx_ring_next_];
   this->rx_ring_next_ = (this->rx_ring_next_ + 1) % RX_RING;
   uint32_t seq = slot.seq.load(std::memory_order_relaxed);
   slot.seq.store(seq + 1, std::memory_order_relaxed);
   std::atomic_thread_fence(std::memory_order_release);
-  memcpy(slot.key, key, RX_KEY_LEN);
-  slot.t = t;
+  for (int i = 0; i < RX_SLOT_WORDS; i++)
+    slot.words[i].store(words[i], std::memory_order_relaxed);
   slot.seq.store(seq + 2, std::memory_order_release);
 }
 
+// The oldest unused stamp for this key that is recent enough, which is then marked used: a stamp belongs
+// to one request, so a retransmission with the same transmit timestamp takes the next one or none.
 bool PPSNTPServer::rx_lookup_(const uint8_t *key, int64_t now_us, int64_t *t_out) {
+  RxStamp *best = nullptr;
+  uint32_t best_seq = 0;
+  int64_t best_t = 0;
   for (auto &slot : this->rx_ring_) {
     uint32_t before = slot.seq.load(std::memory_order_acquire);
-    if (before == 0 || (before & 1) != 0)
+    if (before == 0 || (before & 1) != 0 || slot.used.load(std::memory_order_relaxed) == before)
       continue;
-    uint8_t slot_key[RX_KEY_LEN];
-    memcpy(slot_key, slot.key, RX_KEY_LEN);
-    int64_t t = slot.t;
+    uint32_t words[RX_SLOT_WORDS];
+    for (int i = 0; i < RX_SLOT_WORDS; i++)
+      words[i] = slot.words[i].load(std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_acquire);
     if (slot.seq.load(std::memory_order_relaxed) != before)
       continue;
-    if (memcmp(slot_key, key, RX_KEY_LEN) == 0 && t <= now_us && now_us - t < RX_STAMP_MAX_AGE_US) {
-      *t_out = t;
-      return true;
+    auto t = static_cast<int64_t>((static_cast<uint64_t>(words[RX_KEY_WORDS + 1]) << 32) | words[RX_KEY_WORDS]);
+    if (memcmp(words, key, RX_KEY_LEN) != 0 || t > now_us || now_us - t >= RX_STAMP_MAX_AGE_US)
+      continue;
+    if (best == nullptr || t < best_t) {
+      best = &slot;
+      best_seq = before;
+      best_t = t;
     }
   }
-  return false;
+  if (best == nullptr || best->used.exchange(best_seq, std::memory_order_relaxed) == best_seq)
+    return false;
+  *t_out = best_t;
+  return true;
 }
 
 // Prefers the driver-level stamp for this request when there is one. The stack stamp is always the later
 // of the two; the difference is what the driver hook buys, reported as rx_timestamp_gain.
-int64_t PPSNTPServer::choose_rx_stamp_(const uint8_t *request, uint16_t src_port, int64_t stack_us) {
+int64_t PPSNTPServer::choose_rx_stamp_(const uint8_t *request, const uint8_t *src_addr, uint16_t src_port,
+                                       int64_t stack_us) {
   if (!this->rx_hook_active_.load(std::memory_order_relaxed))
     return stack_us;
   uint8_t key[RX_KEY_LEN];
-  memcpy(key, request + 40, 8);
-  key[8] = src_port >> 8;
-  key[9] = src_port & 0xFF;
+  make_rx_key(request + 40, src_addr, src_port, key);
   int64_t hook_us;
   if (!this->rx_lookup_(key, stack_us, &hook_us)) {
     this->rx_hook_misses_++;
@@ -1607,9 +1648,20 @@ void PPSNTPServer::raw_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
   uint8_t request[48];
   if (p != nullptr && p->tot_len >= sizeof(request) &&
       pbuf_copy_partial(p, request, sizeof(request), 0) == sizeof(request)) {
+    uint8_t src[16] = {};
+#if LWIP_IPV4
+    if (IP_IS_V4(addr)) {
+      uint32_t v4 = ip4_addr_get_u32(ip_2_ip4(addr));  // network byte order
+      map_ipv4(reinterpret_cast<const uint8_t *>(&v4), src);
+    }
+#endif
+#if LWIP_IPV6
+    if (IP_IS_V6(addr))
+      memcpy(src, ip_2_ip6(addr)->addr, 16);
+#endif
     struct pbuf *out = pbuf_alloc(PBUF_TRANSPORT, 48, PBUF_RAM);
     if (out != nullptr) {
-      if (self->build_reply_(request, rx_local, port, static_cast<uint8_t *>(out->payload))) {
+      if (self->build_reply_(request, rx_local, src, port, static_cast<uint8_t *>(out->payload))) {
         udp_sendto(pcb, out, addr, port);
 #if LWIP_IPV4
         if (IP_IS_V4(addr))
@@ -1671,20 +1723,22 @@ void PPSNTPServer::ntp_loop_() {
         continue;
       uint8_t reply[48];
       uint16_t src_port;
+      uint8_t src[16];      // IPv4 as ::ffff:a.b.c.d, the form the dual-stack socket reports it in
       uint32_t src_v4 = 0;  // network byte order; 0 = not IPv4
 #if LWIP_IPV6
       const auto *src6 = reinterpret_cast<const struct sockaddr_in6 *>(&source);
       src_port = ntohs(src6->sin6_port);
-      const uint8_t *a = reinterpret_cast<const uint8_t *>(&src6->sin6_addr);
+      memcpy(src, &src6->sin6_addr, 16);
       static const uint8_t V4_MAPPED[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
-      if (memcmp(a, V4_MAPPED, 12) == 0)
-        memcpy(&src_v4, a + 12, 4);
+      if (memcmp(src, V4_MAPPED, 12) == 0)
+        memcpy(&src_v4, src + 12, 4);
 #else
       const auto *src4 = reinterpret_cast<const struct sockaddr_in *>(&source);
       src_port = ntohs(src4->sin_port);
       src_v4 = src4->sin_addr.s_addr;
+      map_ipv4(reinterpret_cast<const uint8_t *>(&src_v4), src);
 #endif
-      if (this->build_reply_(request, rx_local, src_port, reply)) {
+      if (this->build_reply_(request, rx_local, src, src_port, reply)) {
         sendto(sock, reply, sizeof(reply), 0, reinterpret_cast<struct sockaddr *>(&source), source_len);
         this->note_client_ipv4_(src_v4);
       }

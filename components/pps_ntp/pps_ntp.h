@@ -33,12 +33,19 @@ struct pbuf;
 namespace esphome::pps_ntp {
 
 /// Length of the key that ties a driver-level receive stamp to the request it belongs to: the client's
-/// transmit timestamp (8 bytes, echoed in the request) followed by its UDP source port (big-endian).
-static constexpr int RX_KEY_LEN = 10;
+/// transmit timestamp (8 bytes, echoed in the request), its UDP source port (big-endian) and its source
+/// address (16 bytes; IPv4 as an IPv4-mapped IPv6 address, ::ffff:a.b.c.d).
+static constexpr int RX_KEY_LEN = 26;
+
+/// Builds that key. `addr16` is the source address in the 16-byte form above.
+void make_rx_key(const uint8_t *transmit_ts, const uint8_t *addr16, uint16_t port, uint8_t *key);
+
+/// Writes an IPv4 address (4 bytes, network order) as the IPv4-mapped IPv6 address ::ffff:a.b.c.d.
+void map_ipv4(const uint8_t *v4, uint8_t *addr16);
 
 /// Parses a raw Ethernet frame. Returns true when it is an NTP client request (mode 3) to `port`, over
-/// IPv4 (unfragmented) or IPv6 (no extension headers), and fills `key`. Pure function: no platform
-/// calls, so the host tests can exercise it directly.
+/// IPv4 (unfragmented) or IPv6 (no extension headers), whose declared IP and UDP lengths hold the whole
+/// request, and fills `key`. Pure function: no platform calls, so the host tests can exercise it directly.
 bool parse_ntp_request_frame(const uint8_t *frame, uint32_t length, uint16_t port, uint8_t *key);
 
 /// Converts an NMEA coordinate (`ddmm.mmmm` or `dddmm.mmmm`) and its hemisphere letter (N/S/E/W) into
@@ -117,24 +124,30 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   static void ntp_task(void *arg);
   void ntp_loop_();
   bool start_server_();
-  // Fills a 48-byte reply for a 48-byte (or longer) request; false means stay silent
-  bool build_reply_(const uint8_t *request, int64_t rx_local_us, uint16_t src_port, uint8_t *reply);
+  // Fills a 48-byte reply for a 48-byte (or longer) request from `src_addr` (16 bytes, IPv4-mapped for
+  // IPv4) and `src_port`; false means stay silent
+  bool build_reply_(const uint8_t *request, int64_t rx_local_us, const uint8_t *src_addr, uint16_t src_port,
+                    uint8_t *reply);
 
   // ---- Driver-level receive timestamps ----
   // The stack-level stamp is taken after the frame has crossed the driver and lwIP; that delay lands in the
   // client's offset at half its size and no client can detect it. A hook on the Ethernet driver's input
   // path stamps each NTP request before lwIP sees it, keyed so the reply path can find it again.
+  // Each slot is a seqlock with one writer (the driver task). The payload is held in relaxed atomic words,
+  // so a reader overlapping a write gets a torn copy it then discards, never a data race.
+  static constexpr int RX_KEY_WORDS = (RX_KEY_LEN + 3) / 4;
+  static constexpr int RX_SLOT_WORDS = RX_KEY_WORDS + 2;  // the key, zero-padded, then the stamp (low, high)
   struct RxStamp {
-    std::atomic<uint32_t> seq{0};  // seqlock: odd = write in progress; 0 = never written
-    uint8_t key[RX_KEY_LEN]{};
-    int64_t t{0};
+    std::atomic<uint32_t> seq{0};   // odd = write in progress; 0 = never written
+    std::atomic<uint32_t> used{0};  // the seq whose stamp a reply has already taken: each stamp serves once
+    std::atomic<uint32_t> words[RX_SLOT_WORDS]{};
   };
   static constexpr int RX_RING = 8;
   RxStamp rx_ring_[RX_RING];
   uint8_t rx_ring_next_{0};  // only the driver task writes
   void rx_record_(const uint8_t *key, int64_t t);
   bool rx_lookup_(const uint8_t *key, int64_t now_us, int64_t *t_out);
-  int64_t choose_rx_stamp_(const uint8_t *request, uint16_t src_port, int64_t stack_us);
+  int64_t choose_rx_stamp_(const uint8_t *request, const uint8_t *src_addr, uint16_t src_port, int64_t stack_us);
   std::atomic<int32_t> rx_gain_sum_us_{0};
   std::atomic<uint32_t> rx_gain_count_{0};
   void measure_precision_();
