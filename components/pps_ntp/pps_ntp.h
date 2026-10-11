@@ -209,6 +209,7 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   void reset_discipline_(const char *reason, bool keep_time);
   void log_status_();
   void publish_model_();
+  bool labels_trusted_() const;
   ClockModel get_model_();
   bool is_synced_(const ClockModel &model, int64_t now_local_us) const;
 
@@ -237,12 +238,14 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
 #endif
 
   // Pulses and labels
-  int64_t last_pulse_us_{0};     // most recent plausible pulse: accepted, or a candidate waiting for its RMC
+  double last_pulse_us_{0};      // most recent plausible pulse: accepted, or a candidate waiting for its RMC.
+                                 // The exact edge time, so an accept after a relabel is the same pulse
   int64_t last_pulse_utc_s_{0};  // the label given to that pulse
   bool last_pulse_labelled_{false};
   uint8_t off_second_edges_{0};     // consecutive edges that weren't a whole number of seconds after the last pulse
   uint8_t label_confirmations_{0};  // RMC sentences that agreed with the pulse count since the last reset
-  int64_t last_rmc_valid_us_{0};  // local time of the last RMC with an 'A' fix
+  uint8_t trusted_confirmations_{0};  // ...of which the receiver had confirmed its UTC (NAV-TIMEUTC validUTC)
+  int64_t last_rmc_valid_us_{0};  // local time of the last RMC with an 'A' fix; 0 after an RMC without one
   uint8_t label_mismatches_{0};
   uint8_t outliers_{0};
 
@@ -283,6 +286,7 @@ class PPSNTPServer : public PollingComponent, public uart::UARTDevice {
   int64_t leap_midnight_unix_{0};  // the UTC midnight the leap belongs to (the 00:00:00 that follows it)
   bool leap_from_ubx_{false};
   uint32_t last_timels_poll_ms_{0};
+  bool timels_polled_{false};
   int64_t leap_at_internal_() const {
     return this->leap_midnight_unix_ + this->leap_adj_s_ - (this->leap_change_ < 0 ? 1 : 0);
   }

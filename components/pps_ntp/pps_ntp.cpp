@@ -1,6 +1,7 @@
 #include "pps_ntp.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -57,6 +58,7 @@ static constexpr double MAX_RATE_ERROR_PPM = 500.0;   // reject fits that imply 
 static constexpr int64_t MAX_PULSE_GAP_S = 600;       // longer gaps are relabelled from NMEA
 static constexpr int64_t FIX_STALE_US = 3000000;      // pulses only count while the receiver reports a fix
 static constexpr int64_t RMC_MAX_DELAY_US = 950000;   // RMC must follow its pulse within this window
+static constexpr double MAX_ALIGN_TOLERANCE_US = 100000;  // an edge further than this from a whole second isn't PPS
 static constexpr uint32_t UBX_POLL_INTERVAL_MS = 10000;
 static constexpr uint32_t UBX_POLL_FAST_MS = 2000;
 static constexpr uint32_t TIMELS_POLL_MS = 60000;
@@ -136,6 +138,12 @@ static int64_t days_from_civil(int y, int m, int d) {
 }
 
 static int two_digits(const char *p) { return (p[0] - '0') * 10 + (p[1] - '0'); }
+
+static int days_in_month(int year, int month) {
+  static const int DAYS[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  bool leap_year = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+  return month == 2 && leap_year ? 29 : DAYS[month - 1];
+}
 
 static bool all_digits(const char *p, int n) {
   for (int i = 0; i < n; i++) {
@@ -260,8 +268,11 @@ void PPSNTPServer::loop() {
     this->last_ubx_poll_ms_ = now_ms;
     this->send_ubx_(0x01, 0x21, nullptr, 0);  // poll UBX-NAV-TIMEUTC for the validUTC flag
   }
-  // Leap-second schedule (u-blox 8 and later; older receivers don't answer, and the leap is then taken from NMEA)
-  if (this->utc_trusted_ && now_ms - this->last_timels_poll_ms_ >= TIMELS_POLL_MS) {
+  // Leap-second schedule (u-blox 8 and later; older receivers don't answer, and the leap is then taken from
+  // NMEA). First asked as soon as UTC is trusted and a pulse is labelled, since the answer needs both.
+  if (this->utc_trusted_ && this->hist_count_ > 0 &&
+      (!this->timels_polled_ || now_ms - this->last_timels_poll_ms_ >= TIMELS_POLL_MS)) {
+    this->timels_polled_ = true;
     this->last_timels_poll_ms_ = now_ms;
     this->send_ubx_(0x01, 0x26, nullptr, 0);
   }
@@ -705,11 +716,14 @@ void PPSNTPServer::handle_pulse_(double local_us) {
     if (seconds > MAX_PULSE_GAP_S) {
       this->reset_discipline_("PPS gap too long", true);  // the model is only as stale as its holdover
     } else {
+      // An edge within max_residual of a whole second is labelled here and left to the fit's outlier test;
+      // the 100 ppm term covers the rate before the model has one. Past MAX_ALIGN_TOLERANCE_US it is not
+      // the PPS at all, whatever max_residual says.
       double error = elapsed - seconds * rate;
-      double tolerance = 300.0 + 100e-6 * elapsed;
+      double tolerance = std::min(this->max_residual_us_ + 100e-6 * elapsed, MAX_ALIGN_TOLERANCE_US);
       if (std::fabs(error) <= tolerance) {
         this->off_second_edges_ = 0;
-        this->last_pulse_us_ = llround(local_us);
+        this->last_pulse_us_ = local_us;
         this->last_pulse_utc_s_ = this->last_accepted_utc_s_ + seconds;
         this->last_pulse_labelled_ = true;
         this->accept_pulse_(local_us, this->last_pulse_utc_s_);
@@ -725,7 +739,7 @@ void PPSNTPServer::handle_pulse_(double local_us) {
   }
 
   // Candidate: the next valid RMC labels it
-  this->last_pulse_us_ = llround(local_us);
+  this->last_pulse_us_ = local_us;
   this->last_pulse_labelled_ = false;
 }
 
@@ -802,7 +816,7 @@ void PPSNTPServer::accept_pulse_(double local_us, int64_t utc_s) {
   next.anchor_utc_s = utc_s;
   next.local_us_per_s = rate;
   next.last_pulse_local_us = llround(local_us);
-  next.utc_trusted = this->utc_trusted_;
+  next.utc_trusted = this->labels_trusted_();
   this->fill_leap_(next);
   if (next.valid && next.utc_trusted)
     this->ever_synced_.store(true, std::memory_order_relaxed);
@@ -822,9 +836,10 @@ void PPSNTPServer::reset_discipline_(const char *reason, bool keep_time) {
   this->label_mismatches_ = 0;
   this->label_confirmations_ = 0;
   this->off_second_edges_ = 0;
+  this->trusted_confirmations_ = 0;
   this->jitter_sq_us_ = 0;
-  if (this->leap_change_ == 0)
-    this->leap_adj_s_ = 0;  // no history left that was labelled with it
+  // leap_adj_s_ stays: it defines the internal time scale, which a held model's anchor is on, and the
+  // new labels are put on the same scale
   this->relocking_ = keep_time && this->model_.valid;
   if (!this->relocking_) {
     portENTER_CRITICAL(&this->lock_);
@@ -842,10 +857,20 @@ void PPSNTPServer::fill_leap_(ClockModel &model) const {
                         this->leap_midnight_unix_ - now_unix <= LEAP_ANNOUNCE_S;
 }
 
+// The labels can be trusted once RMCs sent while the receiver vouched for its UTC have agreed with them.
+// A fit labelled while UTC was not yet valid can be whole seconds out (leap seconds unknown) and must be
+// re-confirmed, and relabelled if those RMCs disagree, before it serves.
+bool PPSNTPServer::labels_trusted_() const {
+  return this->utc_trusted_ && this->trusted_confirmations_ >= MIN_LABEL_CONFIRMATIONS;
+}
+
 void PPSNTPServer::publish_model_() {
   ClockModel next = this->model_;
-  next.utc_trusted = this->utc_trusted_;
+  // A held model kept its labels' trust from when it was fitted; it can lose it here, not gain it
+  next.utc_trusted = this->relocking_ ? this->utc_trusted_ && this->model_.utc_trusted : this->labels_trusted_();
   this->fill_leap_(next);
+  if (next.valid && next.utc_trusted)
+    this->ever_synced_.store(true, std::memory_order_relaxed);
   portENTER_CRITICAL(&this->lock_);
   this->model_ = next;
   portEXIT_CRITICAL(&this->lock_);
@@ -925,11 +950,14 @@ void PPSNTPServer::feed_byte_(uint8_t byte) {
 }
 
 void PPSNTPServer::handle_nmea_(char *line) {
+  // Exactly two hex digits after the '*', and nothing after them
   char *star = strchr(line, '*');
   uint8_t checksum = 0;
   for (char *p = line + 1; star != nullptr && p < star; p++)
     checksum ^= static_cast<uint8_t>(*p);
-  if (star == nullptr || strlen(star) < 3 || checksum != static_cast<uint8_t>(strtoul(star + 1, nullptr, 16))) {
+  if (star == nullptr || strlen(star) != 3 || !isxdigit(static_cast<unsigned char>(star[1])) ||
+      !isxdigit(static_cast<unsigned char>(star[2])) ||
+      checksum != static_cast<uint8_t>(strtoul(star + 1, nullptr, 16))) {
     this->nmea_bad_++;
     return;
   }
@@ -1009,15 +1037,26 @@ void PPSNTPServer::handle_gga_(char **fields, int count) {
 
 void PPSNTPServer::handle_rmc_(char **fields, int count) {
   int64_t now_us = esp_timer_get_time();
-  if (count < 10 || fields[2][0] != 'A')
+  if (count < 3)
+    return;
+  if (fields[2][0] != 'A') {
+    // The receiver says it has no fix: its pulse is free-running from now on, so stop counting pulses at
+    // once rather than when the last good fix goes stale
+    this->last_rmc_valid_us_ = 0;
+    return;
+  }
+  if (count < 10)
     return;
 
+  // hhmmss, or hhmmss.f+ with an all-zero fraction: only whole-second epochs line up with a pulse
   const char *time = fields[1];
   const char *date = fields[9];
-  if (strlen(time) < 6 || !all_digits(time, 6) || strlen(date) != 6 || !all_digits(date, 6))
+  size_t time_len = strlen(time);
+  if (time_len < 6 || !all_digits(time, 6) || strlen(date) != 6 || !all_digits(date, 6))
     return;
-  // Only whole-second epochs line up with a pulse
-  if (time[6] == '.') {
+  if (time_len > 6) {
+    if (time[6] != '.' || time_len == 7)
+      return;
     for (const char *p = time + 7; *p != '\0'; p++) {
       if (*p != '0')
         return;
@@ -1026,7 +1065,8 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
 
   int day = two_digits(date), month = two_digits(date + 2), year = 2000 + two_digits(date + 4);
   int hour = two_digits(time), minute = two_digits(time + 2), second = two_digits(time + 4);
-  if (day < 1 || day > 31 || month < 1 || month > 12 || hour > 23 || minute > 59 || second > 60)
+  if (month < 1 || month > 12 || day < 1 || day > days_in_month(year, month) || hour > 23 || minute > 59 ||
+      second > 60)
     return;
   bool leap_second_now = second == 60;  // 23:59:60, an inserted leap second in progress
   if (leap_second_now && (hour != 23 || minute != 59))
@@ -1067,7 +1107,7 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
   }
 
   // A u-blox receiver sends the RMC for an epoch shortly after that epoch's pulse
-  int64_t age = now_us - this->last_pulse_us_;
+  double age = static_cast<double>(now_us) - this->last_pulse_us_;
   if (this->last_pulse_us_ == 0 || age <= 0 || age > RMC_MAX_DELAY_US)
     return;
 
@@ -1078,6 +1118,8 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
       this->label_mismatches_ = 0;
       if (this->label_confirmations_ < UINT8_MAX)
         this->label_confirmations_++;
+      if (this->utc_trusted_ && this->trusted_confirmations_ < UINT8_MAX)
+        this->trusted_confirmations_++;
       return;
     }
     if (++this->label_mismatches_ < 3)
@@ -1085,7 +1127,7 @@ void PPSNTPServer::handle_rmc_(char **fields, int count) {
     this->reset_discipline_("NMEA time disagrees with PPS count", false);
   }
 
-  ESP_LOGD(TAG, "Labelling the pulse from %lld ms ago as unix %lld (from RMC)", static_cast<long long>(age / 1000),
+  ESP_LOGD(TAG, "Labelling the pulse from %lld ms ago as unix %lld (from RMC)", static_cast<long long>(age / 1000.0),
            static_cast<long long>(utc_s));
   this->last_pulse_labelled_ = true;
   this->last_pulse_utc_s_ = utc_s;

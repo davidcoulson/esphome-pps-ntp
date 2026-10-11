@@ -34,7 +34,11 @@ struct Sim : PPSNTPServer {
   uint32_t module_baud = 9600;
   bool module_accepts_cfg_prt = true;
   bool fix = true;
+  std::function<bool(int64_t)> no_fix_at = [](int64_t) { return false; };  // epochs whose RMC says V
   bool pps_on = true;
+  bool nmea_on = true;          // sentences keep coming without PPS (a receiver with no fix still talks)
+  bool capture = false;         // MCPWM-like capture: sub-µs edge times handed straight to the discipline
+  double capture_frac_us = 0.375;
   bool answers_ubx = true;      // answers UBX at all
   bool answers_timeutc = true;  // answers NAV-TIMEUTC specifically (some receivers know only some messages)
   bool utc_valid = true;
@@ -48,11 +52,13 @@ struct Sim : PPSNTPServer {
   std::function<bool(int64_t)> stalled = [](int64_t) { return false; };
   std::function<bool(int64_t)> drop_epoch = [](int64_t) { return false; };  // sentences lost, e.g. RX overflow
   std::function<int64_t(int64_t)> glitch_after_pulse_us = [](int64_t) { return 0; };  // 0 = none
+  std::function<int64_t(int64_t)> pulse_err_us = [](int64_t) { return 0; };  // receiver error on pulse k (not truth)
 
   // Results
   double worst_served_error_us = 0;
   int64_t first_synced_s = -1;
   int served = 0, silent = 0, unsynced = 0;
+  bool saw_relocking = false;  // the holdover relock path (a keep_time reset) ran at some point
   size_t tx_seen = 0;
 
   Sim() {
@@ -101,7 +107,7 @@ struct Sim : PPSNTPServer {
     if (in_leap) tm.tm_sec = 60;  // 23:59:59 + 1
     char body[128];
     snprintf(body, sizeof(body), "GPRMC,%02d%02d%02d.00,%c,4124.8963,N,08151.6838,W,0.0,0.0,%02d%02d%02d,,,A",
-             tm.tm_hour, tm.tm_min, tm.tm_sec, fix ? 'A' : 'V', tm.tm_mday, tm.tm_mon + 1, tm.tm_year % 100);
+             tm.tm_hour, tm.tm_min, tm.tm_sec, fix && !no_fix_at(k) ? 'A' : 'V', tm.tm_mday, tm.tm_mon + 1, tm.tm_year % 100);
     rx(nmea(body));
     // Quality 0 without a fix; the receiver keeps repeating its last position, which must not count.
     // The altitude alternates a metre either side of 250 so the interval mean is exercised.
@@ -186,25 +192,31 @@ struct Sim : PPSNTPServer {
     if (check && std::fabs(err) > std::fabs(worst_served_error_us)) worst_served_error_us = err;
   }
 
-  void run(int64_t seconds, bool check = true) {
-    static bool started = false;
-    (void) started;
+  void run(double seconds, bool check = true) {
     std::normal_distribution<double> noise(0.0, jitter_us);
-    int64_t end = g_now_us + seconds * 1000000;
+    int64_t end = g_now_us + std::llround(seconds * 1e6);
     while (g_now_us < end) {
       int64_t tick_end = g_now_us + 1000;
-      // Pulse (and optional glitch) due in this millisecond?
+      // Epoch (pulse, optional glitch, sentences) due in this millisecond?
       long double per = 1e6L * (1.0L + PPM * 1e-6L);
-      int64_t k = static_cast<int64_t>(std::ceil((g_now_us - L0 - phase_offset_us) / per));  // next pulse at or after now
+      int64_t k = static_cast<int64_t>(std::ceil((g_now_us - L0 - phase_offset_us) / per));  // next epoch at or after now
       int64_t pulse_at = L0 + phase_offset_us + static_cast<int64_t>(std::llround(k * per));
-      if (k >= 0 && pulse_at < tick_end && pulse_at >= g_now_us && pps_on && k != last_k) {
+      if (k >= 0 && pulse_at < tick_end && pulse_at >= g_now_us && k != last_k) {
         last_k = k;
-        g_now_us = pulse_at + static_cast<int64_t>(std::llround(noise(rng)));
-        PPSNTPServer::pps_isr(this);
-        epoch_due_us = pulse_at + 100000;
-        epoch_k = k;
-        int64_t g = glitch_after_pulse_us(k);
-        glitch_due_us = g ? pulse_at + g : 0;
+        if (pps_on) {
+          g_now_us = pulse_at + static_cast<int64_t>(std::llround(noise(rng))) + pulse_err_us(k);
+          if (capture) {
+            this->handle_pulse_(static_cast<double>(g_now_us) + capture_frac_us);
+          } else {
+            PPSNTPServer::pps_isr(this);
+          }
+          int64_t g = glitch_after_pulse_us(k);
+          glitch_due_us = g ? pulse_at + g : 0;
+        }
+        if (nmea_on) {
+          epoch_due_us = pulse_at + 100000;
+          epoch_k = k;
+        }
       }
       if (glitch_due_us && glitch_due_us < tick_end) { g_now_us = glitch_due_us; PPSNTPServer::pps_isr(this); glitch_due_us = 0; }
       if (epoch_due_us && epoch_due_us < tick_end) { if (!drop_epoch(epoch_k)) send_epoch(epoch_k); epoch_due_us = 0; }
@@ -213,6 +225,7 @@ struct Sim : PPSNTPServer {
         this->loop();
         service_tx();
       }
+      saw_relocking |= this->relocking_;
       if (this->pulses_accepted_ > this->edges_seen_ && !g_counter_underflow) {
         g_counter_underflow = true;
         printf("    !! pulses_accepted (%u) > edges_seen (%u) at t=%.3f s\n", this->pulses_accepted_, this->edges_seen_,
@@ -226,7 +239,8 @@ struct Sim : PPSNTPServer {
   }
   int64_t last_k = -1, epoch_due_us = 0, epoch_k = 0, glitch_due_us = 0;
 
-  int resets = 0;
+  // The client address every scripted query comes from (an IPv4-mapped 192.0.2.1)
+  static constexpr uint8_t CLIENT[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 192, 0, 2, 1};
 };
 
 static int failures = 0;
@@ -269,6 +283,18 @@ int main(int argc, char **argv) {
     s.update();
     check(s.rejected.state > 20, "rejected-pulse counter recorded the glitches");
     check(s.nmea_err.state == 0, "no NMEA checksum errors");
+  }
+
+  begin("C2. GPIO interrupt: three edges in a row 700 us late, inside the 1000 us max_residual");
+  {
+    Sim s; s.setup(); s.run(60);
+    int64_t kf = s.last_k + 2;
+    s.pulse_err_us = [kf](int64_t k) -> int64_t { return k >= kf && k < kf + 3 ? 700 : 0; };
+    int unsynced_before = s.unsynced, silent_before = s.silent;
+    uint32_t a0 = s.pulses_accepted_, e0 = s.edges_seen_;
+    s.run(10);
+    check(s.unsynced == unsynced_before && s.silent == silent_before, "late edges inside max_residual don't reset the discipline");
+    check(s.pulses_accepted_ - a0 == s.edges_seen_ - e0, "and they are used, not dropped as off-second edges");
   }
 
   begin("D. Loop stalls 1.2 s right at the first label and loses a sentence (#2)");
@@ -319,39 +345,74 @@ int main(int argc, char **argv) {
     check(s.served > 0, "serves once UTC is confirmed");
   }
 
-  begin("I. Fix lost for 120 s (pulses free-run +2 ms), then regained");
+  begin("H2. Cold start: NMEA two seconds off while validUTC is false, then both corrected together");
+  {
+    Sim s; s.utc_valid = false; s.date_offset_s = -2; s.set_require_utc_valid(true); s.setup();
+    s.run(60, false);
+    check(s.served == 0, "nothing served at stratum 1 while UTC is not valid");
+    s.date_offset_s = 0; s.utc_valid = true; s.run(30);
+    printf("    worst served error %.1f us, served=%d\n", s.worst_served_error_us, s.served);
+    check(s.served > 0, "serves once the fit is relabelled");
+    check(std::fabs(s.worst_served_error_us) < 50, "never serves the fit labelled before UTC was valid");
+  }
+
+  begin("I. Fix lost for 120 s (pulses free-run, drifting to +2 ms), then regained");
   {
     Sim s; s.setup(); s.run(60);
     int unsynced_before = s.unsynced;
-    s.fix = false; s.run(120);
+    int64_t kf = s.last_k + 1, kr = kf + 120;
+    s.no_fix_at = [kf, kr](int64_t k) { return k >= kf && k < kr; };
+    // Free-running from the first epoch without a fix; back on the second once the fix returns
+    s.pulse_err_us = [kf, kr](int64_t k) -> int64_t { return k > kf && k < kr ? (k - kf) * 2000 / 120 : 0; };
+    s.run(120);
     check(s.unsynced == unsynced_before, "holds over as stratum 1 inside the holdover window");
     check(std::fabs(s.worst_served_error_us) < 200, "holdover error under 200 us after 120 s");
-    s.fix = true; s.run(60);
+    s.run(60);
     check(std::fabs(s.worst_served_error_us) < 200, "re-locks without serving a bad time");
+    check(s.unsynced == unsynced_before, "and without dropping to stratum 16");
   }
 
-  begin("J. PPS and NMEA vanish for 20 minutes (holdover is 15)");
+  begin("I2. Receiver reports V: the very next pulse is no longer used (fit_window 8, pulses free-run 100 us/s)");
+  {
+    Sim s; s.set_fit_window(8); s.setup(); s.run(60);
+    int64_t k0 = s.last_k, kf = k0 + 2;  // the receiver loses its fix two epochs from now
+    s.no_fix_at = [kf](int64_t k) { return k >= kf; };
+    s.pulse_err_us = [kf](int64_t k) -> int64_t { return k > kf ? (k - kf) * 100 : 0; };
+    uint32_t a0 = s.pulses_accepted_;
+    s.worst_served_error_us = 0; s.run(120);
+    printf("    pulses used after the last good one: %u (expected %lld), worst served error %.1f us\n",
+           s.pulses_accepted_ - a0, (long long) (kf - k0), s.worst_served_error_us);
+    check(s.pulses_accepted_ - a0 == kf - k0, "only pulses up to the first V epoch enter the fit");
+    check(std::fabs(s.worst_served_error_us) < 200, "holdover unaffected by the free-running pulses");
+  }
+
+  begin("J. Receiver unplugged for 20 minutes (holdover is 15); sentences return just before PPS");
   {
     Sim s; s.setup(); s.run(60);
-    s.pps_on = false; s.fix = false; s.run(20 * 60, false);
+    s.pps_on = false; s.nmea_on = false; s.run(20 * 60, false);
     check(s.unsynced > 0, "drops to stratum 16 after the holdover expires");
-    int before = s.served;
-    int silent_before = s.silent;
-    s.pps_on = true; s.fix = true; s.run(30);
+    int before = s.served, silent_before = s.silent;
+    s.nmea_on = true; s.run(1.5, false);  // RMCs with a fix first, as after a receiver restart
+    s.pps_on = true; s.run(30);
+    check(s.saw_relocking, "the first pulse back took the long-gap path (relabel from NMEA)");
     check(s.served > before, "recovers when the receiver comes back");
     check(s.silent == silent_before, "answers (stratum 16) rather than going silent while re-locking");
   }
 
-  begin("J2. PPS gap of 11 minutes (longer than the 600 s relabel limit, shorter than the 15 min holdover)");
+  begin("J2. PPS lost for 11 minutes (past the 600 s relabel limit, inside the 15 min holdover), crystal 150 us off");
   {
-    Sim s; s.setup(); s.run(60);
+    Sim s; s.set_max_residual_us(100); s.setup(); s.run(60);
     int unsynced_before = s.unsynced, silent_before = s.silent;
-    s.pps_on = false; s.fix = false; s.run(11 * 60, false);
-    s.pps_on = true; s.fix = true; s.run(30);
-    check(s.unsynced == unsynced_before && s.silent == silent_before, "kept serving stratum 1 on holdover through the re-lock");
+    s.pps_on = false; s.fix = false; s.run(11 * 60, false);  // the receiver keeps talking, reporting V
+    s.phase_offset_us = 150;                                  // the held model is now 150 us off the second
+    s.fix = true; s.run(1.5, false);                          // 'A' again just before the pulses return
+    s.pps_on = true; s.worst_served_error_us = 0; s.run(30);
+    check(s.saw_relocking, "the gap took the relabel-and-relock path");
+    check(s.unsynced == unsynced_before && s.silent == silent_before,
+          "kept serving stratum 1 on holdover through the re-lock (no outlier test against the held model)");
     check(std::fabs(s.worst_served_error_us) < 200, "held-over time stayed within 200 us");
-    s.run(30);
-    check(s.first_synced_s > 0 && s.served > 0, "locked again on the new pulses");
+    s.worst_served_error_us = 0; s.run(30);
+    check(std::fabs(s.worst_served_error_us) < 50, "locked again on the new pulses");
   }
 
   begin("K. PPS phase steps by 5 ms (receiver re-acquisition)");
@@ -364,27 +425,64 @@ int main(int argc, char **argv) {
     check(std::fabs(s.worst_served_error_us) < 50, "re-disciplines to the new phase within 10 s");
   }
 
+  begin("K2. Hardware capture (sub-us edges): NMEA jumps a second, the fit relabels; each edge counted once");
+  {
+    Sim s; s.capture = true; s.set_max_residual_us(200); s.setup(); s.hw_capture_ = true; s.run(30);
+    check(s.served > 0 && std::fabs(s.worst_served_error_us) < 50, "synced on sub-microsecond edges");
+    uint32_t a0 = s.pulses_accepted_, e0 = s.edges_seen_;
+    s.date_offset_s = 1; s.run(15, false);
+    printf("    edges %u, counted as accepted %u\n", s.edges_seen_ - e0, s.pulses_accepted_ - a0);
+    check(s.pulses_accepted_ - a0 <= s.edges_seen_ - e0, "the relabelled pulse is not counted a second time");
+  }
+
   // 2026-12-31 23:59:59 UTC = 1798761599
   begin("L. Inserted leap second, announced in advance (NAV-TIMELS, u-blox 8+)");
   {
     Sim s; s.answers_timels = true; s.leap_k = 100; s.t0 = 1798761599 - 99; s.setup();
-    s.run(90); int li1_before = s.li_seen[1];
-    s.run(60);
-    printf("    worst served error %.1f us; LI=1 replies before the leap: %d, LI=0 after: %s\n", s.worst_served_error_us, li1_before, s.li_seen[1] == li1_before || true ? "yes" : "no");
+    s.run(30); int unsynced_before = s.unsynced, silent_before = s.silent;
+    s.run(60); int li1_before = s.li_seen[1];
+    s.run(15); int li1_after_leap = s.li_seen[1];  // the leap is pulse 100, ~101 s in
+    s.run(75);
+    printf("    worst served error %.1f us; LI=1 replies before the leap: %d, after it: %d\n", s.worst_served_error_us,
+           li1_before, s.li_seen[1] - li1_after_leap);
     check(li1_before > 0, "announces the leap (LI=1) beforehand");
     check(std::fabs(s.worst_served_error_us) < 50, "served time right through 23:59:60 and after");
-    int li1_at_leap = s.li_seen[1]; s.run(30);
-    check(s.li_seen[1] == li1_at_leap, "stops announcing once the leap has happened");
-    check(s.silent == 0 || s.first_synced_s > 0, "no reset");
+    check(s.li_seen[1] == li1_after_leap, "stops announcing once the leap has happened");
+    check(s.unsynced == unsynced_before && s.silent == silent_before, "no reset: stratum 1 throughout");
+  }
+
+  begin("L2. Leap second, then an 11-minute PPS gap: the held model keeps its time scale while relocking");
+  {
+    Sim s; s.answers_timels = true; s.leap_k = 100; s.t0 = 1798761599 - 99; s.setup();
+    s.run(150);
+    int unsynced_before = s.unsynced, silent_before = s.silent;
+    s.pps_on = false; s.fix = false; s.run(11 * 60, false);
+    s.fix = true; s.run(1.5, false);
+    s.pps_on = true;
+    for (int i = 0; i < 300 && !s.relocking_; i++) s.run(0.01);
+    check(s.relocking_, "relocking on the held model");
+    // Anything that republishes the model while it relocks (a NAV-TIMEUTC or NAV-TIMELS answer, a leap
+    // being folded in) must not reinterpret the held model's anchor
+    s.publish_model_();
+    s.worst_served_error_us = 0; s.run(10);
+    printf("    worst served error %.1f us\n", s.worst_served_error_us);
+    check(std::fabs(s.worst_served_error_us) < 200, "served time keeps its scale through the relock");
+    check(s.unsynced == unsynced_before && s.silent == silent_before, "stratum 1 throughout");
+  }
+
+  begin("L3. NAV-TIMELS is polled as soon as UTC is trusted, not a minute after boot");
+  {
+    Sim s; s.answers_timels = true; s.setup(); s.run(15);
+    check(s.count_tx(0x01, 0x26) >= 1, "leap-second schedule requested within 15 s");
   }
 
   begin("M. Inserted leap second with no advance notice (NMEA 23:59:60 only, u-blox 6/7)");
   {
     Sim s; s.leap_k = 60; s.t0 = 1798761599 - 59; s.setup();
-    s.run(55); int silent_before = s.silent;
+    s.run(55); int silent_before = s.silent, unsynced_before = s.unsynced;
     s.run(10, false);  // the leap itself: up to ~0.1 s of being a second fast until the RMC arrives
     s.worst_served_error_us = 0; s.run(120);
-    check(s.silent == silent_before, "no discipline reset, never goes silent");
+    check(s.silent == silent_before && s.unsynced == unsynced_before, "no discipline reset: stratum 1 throughout");
     check(std::fabs(s.worst_served_error_us) < 50, "correct from the first second after the leap");
   }
 
@@ -574,6 +672,58 @@ int main(int argc, char **argv) {
     }
     check(std::fabs(placed_sum - floor_sum) < 1e-6, "edges sit on esp_timer_get_time()'s truncated scale");
     check(counter_to_stamp_us(1234567.0, 1.0) == 1234567.0, "a 1 tick/us counter needs no correction");
+  }
+
+  begin("T. Strict NMEA parsing: checksum and RMC time/date fields");
+  {
+    Sim s;
+    auto line = [](const std::string &body) { std::string l = Sim::nmea(body); return l.substr(0, l.size() - 2); };
+    auto feed = [&](const std::string &l) { char buf[96]; snprintf(buf, sizeof(buf), "%s", l.c_str()); s.handle_nmea_(buf); };
+    std::string good = line("GPGSV,1,1,01,02,23,297,45");
+    uint32_t ok0 = s.nmea_ok_, bad0 = s.nmea_bad_;
+    feed(good);
+    check(s.nmea_ok_ == ok0 + 1, "well-formed sentence accepted");
+    feed(good + "junk");
+    check(s.nmea_bad_ == bad0 + 1, "text after the checksum rejected");
+    std::string three = good; three.insert(three.size() - 2, "0");
+    feed(three);
+    check(s.nmea_bad_ == bad0 + 2, "three-digit checksum rejected");
+    std::string one = good.substr(0, good.size() - 1);
+    feed(one);
+    check(s.nmea_bad_ == bad0 + 3 && s.nmea_ok_ == ok0 + 1, "one-digit checksum rejected");
+
+    auto rmc = [&](const char *time, const char *date) {
+      char body[128];
+      snprintf(body, sizeof(body), "GPRMC,%s,A,4124.8963,N,08151.6838,W,0.0,0.0,%s,,,A", time, date);
+      s.last_rmc_valid_us_ = 0;
+      feed(line(body));
+      return s.last_rmc_valid_us_ != 0;
+    };
+    check(rmc("120000.00", "190926"), "well-formed RMC accepted");
+    check(rmc("120000", "190926"), "time without a fraction accepted");
+    check(!rmc("120000junk", "190926"), "junk after the time rejected");
+    check(!rmc("120000.0x", "190926"), "junk in the fraction rejected");
+    check(!rmc("120000.", "190926"), "empty fraction rejected");
+    check(!rmc("120000.50", "190926"), "a fractional epoch is not a pulse epoch");
+    check(!rmc("120000.00", "290226"), "29 February 2026 rejected, not normalised to 1 March");
+    check(rmc("120000.00", "290228"), "29 February 2028 accepted");
+    check(!rmc("120000.00", "310426"), "31 April rejected");
+    check(!rmc("120000.00", "19092"), "short date rejected");
+  }
+
+  begin("U. A model that becomes trusted outside a pulse (publish_model_) marks the server as synchronised");
+  {
+    Sim s; s.utc_valid = false; s.setup(); s.run(30, false);
+    check(s.model_.valid && !s.model_.utc_trusted && !s.ever_synced_, "fit ready, receiver UTC not yet confirmed");
+    // The receiver confirms UTC between pulses, with the labels already confirmed under trusted UTC (for
+    // example it went invalid and valid again): the republish is what makes the model trusted...
+    s.utc_trusted_ = true; s.trusted_confirmations_ = 3;
+    s.publish_model_();
+    check(s.model_.utc_trusted, "published as trusted");
+    // ...and a lost lock before the next pulse must answer stratum 16, not fall silent
+    s.reset_discipline_("test", false);
+    int silent_before = s.silent; s.query(false);
+    check(s.silent == silent_before && s.unsynced > 0, "a reset right after answers stratum 16, not silence");
   }
 
   begin("Z. Counters across every scenario above");
