@@ -56,6 +56,8 @@ static constexpr int64_t GPS_WEEK_ROLLOVER_S = 619315200;    // 1024 weeks
 static constexpr uint32_t BAUD_PROBE_MS = 1500;
 static constexpr double MAX_RATE_ERROR_PPM = 500.0;   // reject fits that imply a broken crystal
 static constexpr int64_t MAX_PULSE_GAP_S = 600;       // longer gaps are relabelled from NMEA
+static constexpr double REF_LATCH_NARROW_US = 2.0;  // a reference latch window wider than this is retried
+static constexpr int REF_LATCH_ATTEMPTS = 8;
 static constexpr int64_t FIX_STALE_US = 3000000;      // pulses only count while the receiver reports a fix
 static constexpr int64_t RMC_MAX_DELAY_US = 950000;   // RMC must follow its pulse within this window
 static constexpr double MAX_ALIGN_TOLERANCE_US = 100000;  // an edge further than this from a whole second isn't PPS
@@ -480,26 +482,51 @@ void PPSNTPServer::sample_ref_(uint32_t *ticks, double *us) {
   // captured edges on the esp_timer timeline. The raw counter (16 MHz) places the latch to ~60 ns;
   // esp_timer_get_time() would round each read to a whole microsecond. The lock also keeps the loop and
   // the Ethernet driver task from latching over each other's reading.
+  // Something can stall those few instructions even inside the critical section: on the P4, windows of
+  // 8-15 µs instead of ~1 µs now and then, most likely a cache miss while the other core holds the
+  // flash/PSRAM bus. The midpoint then misplaces the edge by up to half the window, and that pulse drags
+  // the fit for a minute (PPS jitter 0.5-1.5 µs instead of 0.03). So latch again until the window is
+  // narrow, and use the narrowest one.
   if (this->raw_counter_) {
-    portENTER_CRITICAL(&this->ref_lock_);
-    uint64_t before = esp_timer_impl_get_counter_reg();
-    mcpwm_capture_channel_trigger_soft_catch(this->cap_ref_);
-    uint64_t after = esp_timer_impl_get_counter_reg();
-    mcpwm_capture_get_latched_value(this->cap_ref_, ticks);
-    portEXIT_CRITICAL(&this->ref_lock_);
+    const uint64_t narrow = static_cast<uint64_t>(REF_LATCH_NARROW_US * this->systimer_ticks_per_us_);
+    uint64_t best_width = UINT64_MAX, best_mid2 = 0;
+    for (int attempt = 0; attempt < REF_LATCH_ATTEMPTS && best_width > narrow; attempt++) {
+      uint32_t latched;
+      portENTER_CRITICAL(&this->ref_lock_);
+      uint64_t before = esp_timer_impl_get_counter_reg();
+      mcpwm_capture_channel_trigger_soft_catch(this->cap_ref_);
+      uint64_t after = esp_timer_impl_get_counter_reg();
+      mcpwm_capture_get_latched_value(this->cap_ref_, &latched);
+      portEXIT_CRITICAL(&this->ref_lock_);
+      if (after - before < best_width) {
+        best_width = after - before;
+        best_mid2 = before + after;
+        *ticks = latched;
+      }
+    }
     // Every other stamp (NTP receive and transmit, the driver hook) is a whole-µs esp_timer_get_time(),
     // which truncates: on average it reads (ticks_per_us - 1) / (2 ticks_per_us) µs (0.47 µs at 16 MHz)
     // before the exact counter time. Put the edges on that same scale, or the model maps every stamp
     // to a UTC that much early.
-    *us = counter_to_stamp_us(static_cast<double>(before + after) * 0.5, this->systimer_ticks_per_us_);
+    *us = counter_to_stamp_us(static_cast<double>(best_mid2) * 0.5, this->systimer_ticks_per_us_);
   } else {
-    portENTER_CRITICAL(&this->ref_lock_);
-    int64_t before_us = esp_timer_get_time();
-    mcpwm_capture_channel_trigger_soft_catch(this->cap_ref_);
-    int64_t after_us = esp_timer_get_time();
-    mcpwm_capture_get_latched_value(this->cap_ref_, ticks);
-    portEXIT_CRITICAL(&this->ref_lock_);
-    *us = static_cast<double>(before_us + after_us) * 0.5;
+    int64_t best_width = INT64_MAX, best_mid2 = 0;
+    for (int attempt = 0; attempt < REF_LATCH_ATTEMPTS && best_width > static_cast<int64_t>(REF_LATCH_NARROW_US);
+         attempt++) {
+      uint32_t latched;
+      portENTER_CRITICAL(&this->ref_lock_);
+      int64_t before_us = esp_timer_get_time();
+      mcpwm_capture_channel_trigger_soft_catch(this->cap_ref_);
+      int64_t after_us = esp_timer_get_time();
+      mcpwm_capture_get_latched_value(this->cap_ref_, &latched);
+      portEXIT_CRITICAL(&this->ref_lock_);
+      if (after_us - before_us < best_width) {
+        best_width = after_us - before_us;
+        best_mid2 = before_us + after_us;
+        *ticks = latched;
+      }
+    }
+    *us = static_cast<double>(best_mid2) * 0.5;
   }
 #endif
 }
