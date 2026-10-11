@@ -16,6 +16,8 @@ Hardware status: run on an ESP32-S3-ETH against the `gnss_sim` emulator. Not yet
 - Fix: with MCPWM capture, a pulse relabelled after an RMC disagreement was counted as accepted twice (sub-µs time against its rounded copy), which could underflow `rejected_pulses`. The candidate pulse keeps its exact time, which also keeps its sub-µs precision.
 - NMEA parsing is stricter: the checksum must be exactly two hex digits at the end of the sentence, RMC times must be `hhmmss` or `hhmmss.` followed by zeros, and dates must exist (29 February 2026 was read as 1 March).
 - Driver-level receive stamps: the key now includes the client's address as well as its transmit timestamp and port, each stamp answers one request, and the ring's payload is read and written as atomics inside its seqlock (it was formally a data race). Frames are checked against their declared IP and UDP lengths.
+- Fix: `rx_timestamp_gain` and `rx_interrupt_lead` take each interval's sum and count together. They were exchanged separately while another task added to them, so one sample could split across two intervals and skew both means.
+- `gnss_sim`: the emulator hands each pulse's count and time to its loop as one snapshot (it could pair a count with the next pulse's time), and its PPS on/off flag, shared with the timer callback, is atomic.
 - `UBX-NAV-TIMELS` is polled as soon as UTC is trusted, rather than first at a minute after boot.
 - Validation rejects `enable_lwip_tcpip_core_locking: false` (and `CONFIG_LWIP_TCPIP_CORE_LOCKING: n`): the ARP refresh and `raw_lwip` call lwIP from the main loop and need that lock.
 - README and the example now pin v0.8.1 (v0.7.0 doesn't build on IDF 5.5).
